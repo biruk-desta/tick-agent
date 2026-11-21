@@ -1622,7 +1622,7 @@ class PracticeBot(Bot):
                     best, self.cover = score, point
         return self.cover
 
-    def strafe_move(self, p, zone, target, threats, retreat, hazards, until, terminal, central):
+    def strafe_move(self, p, zone, target, threats, retreat, hazards, until, terminal, central, free_for_all=False):
         now = zone.now
         if now >= self.stride_until or self.duel_target != target.id:
             self.duel_target = target.id
@@ -1631,7 +1631,7 @@ class PracticeBot(Bot):
             self.stride = self.rng.uniform(0.74, 1.38)
             self.sprint = self.rng.random() < 0.44
         course = bearing(p.pos, target.pos)
-        low, high = self.range_band(p, target)
+        low, high = self.ffa_range_band(p, target) if free_for_all else self.range_band(p, target)
         radial = limit((target.dist - (low + high) / 2) / max(8, (high - low) * 0.65), -1.8, 1.8)
         if retreat:
             radial = -1.35
@@ -1697,7 +1697,7 @@ class PracticeBot(Bot):
                 waits.append(cooldown)
         return min(waits, default=0)
 
-    def act(self, obs):
+    def act(self, obs, free_for_all=False):
         start = time.perf_counter()
         until = start + PLAN_BUDGET_S
         obs = obj(obs)
@@ -1722,17 +1722,25 @@ class PracticeBot(Bot):
         elif not in_zone and not urgent:
             goal, urgent = center, True
         central = (zone.next_radius <= 25 and (zone.end - now < 95 or zone.radius <= 45)) and not terminal
+        alive = number(obs.get("alive"), 16)
         self.remember(obs, now)
         eye = limit(self.phys("eye_height", 8, p.stats), 1, 80)
         contacts = self.contacts(obs, pos, eye)
         rivals = self.practice_contacts(obs, p, contacts, now)
         threats = [c for c in rivals if c.id in self.pursuers or (c.clear and c.dist < 75 and c.face_error < 0.72)]
         threats.sort(key=lambda c: (not c.clear, c.dist))
+        if free_for_all:
+            threats = [c for c in rivals if c.attacker or (c.clear and c.dist < 125 and c.face_error < 0.47)
+                       or (c.clear and c.dist < 31)]
+            threats.sort(key=lambda c: (not c.clear, not c.attacker, c.dist))
         self.hunter_count = max(self.hunter_count, len(threats))
         squad = self.hunter_count >= 2 and len(threats) >= 2
-        candidates = [c for c in rivals if central or terminal or not threats or c in threats
-                      or (c.clear and c.dist < 88 and c.hp < 330)]
-        targets = sorted(candidates, key=self.target_merit, reverse=True)
+        if free_for_all:
+            targets = self.ffa_targets(p, rivals, threats, alive, central, terminal)
+        else:
+            candidates = [c for c in rivals if central or terminal or not threats or c in threats
+                          or (c.clear and c.dist < 88 and c.hp < 330)]
+            targets = sorted(candidates, key=self.target_merit, reverse=True)
         target = targets[0] if targets else None
         if target and squad and not target.clear:
             target = next((c for c in targets if c.clear), target)
@@ -1749,7 +1757,9 @@ class PracticeBot(Bot):
         can_repair = (in_zone and not central and self.phys("regen_per_s", 45, p.stats) > 0
                       and self.match_end - now > repair_wait + 3)
         can_finish = target and target.clear and target.hp <= max(140, p.hp * 0.28)
-        self.repairing = can_repair and (p.fraction < (0.84 if self.repairing else 0.52)) and not can_finish
+        repair_start = self.repair_fraction if free_for_all and alive > 2 else 0.52
+        repair_end = 0.96 if free_for_all else 0.84
+        self.repairing = can_repair and p.fraction < (repair_end if self.repairing else repair_start) and not can_finish
         engaged = target and (target.clear or target.id in self.pursuers or now - self.last_damage < 2)
         exposed = sum(c.clear for c in threats[:3])
         cooldown_cover = target and self.ready_in(p, target) > 0.65 and target.dist > 23
@@ -1772,6 +1782,9 @@ class PracticeBot(Bot):
             goal, self.phase = loot[:2], loot_phase
         elif self.repairing and cover is not None:
             goal, self.phase = cover, "repair"
+        elif free_for_all and not terminal and (not target or self.repairing and len(threats) > 1):
+            goal = self.ffa_disengage(p, zone, threats, sound)
+            self.phase = "repair" if self.repairing else "search"
         elif (cover is not None and (cooldown_cover or squad and exposed > 1) and not can_finish
               and (not exposed or distance(pos, cover) > 2 or not self.line(p, target, cover))):
             goal, self.phase = cover, "hide"
@@ -1782,7 +1795,7 @@ class PracticeBot(Bot):
             self.phase = "fight"
             action.update(self.strafe_move(p, zone, target, threats,
                                            not terminal and (self.repairing or squad and exposed > 1),
-                                           hazards, min(until, time.perf_counter() + 0.00175), terminal, central))
+                                           hazards, min(until, time.perf_counter() + 0.00175), terminal, central, free_for_all))
         elif target and (engaged or not self.repairing) and not terminal:
             goal, self.phase = target.pos[:2], "pursuit"
         elif self.repairing:
@@ -1819,6 +1832,7 @@ class PracticeBot(Bot):
                     and not self.arena.solid(raised(pos, p.height + 1))):
                 action["jump"], action["boost"] = p.grounded, not p.grounded
         direction = (bearing(pos, target.pos) if target else sound if sound is not None
+                     else angle(self.scout_yaw + now * SCAN_RATE) if free_for_all and distance(pos, goal) < 3
                      else angle(bearing(pos, goal) + 0.74 * math.sin(1.35 * now + self.scout_yaw)))
         action["aim"] = [direction, 0.0]
 
@@ -1841,6 +1855,90 @@ class PracticeBot(Bot):
             if any(w.get("kind") == "gun" and number(w.get("ammo"), math.inf) <= 5 for w in p.weapons):
                 action["reload"] = True
         return action
+
+
+class FreeForAllBot(PracticeBot):
+    repair_fraction = 0.60
+    opportunity_range = 147
+    commit_fraction = 0.64
+    commit_range = 108
+    duel_advantage = 0.11
+
+    def act(self, obs):
+        return super().act(obs, free_for_all=True)
+
+    def ffa_range_band(self, p, target):
+        return self.range_band(p, target)
+
+    def ffa_targets(self, p, rivals, threats, alive, central, terminal):
+        pressure = sum(c.clear for c in threats)
+        equipped = any(w.get("kind") in ("laser", "mortar", "lightning") for w in p.weapons)
+        candidates = []
+        for rival in rivals:
+            rear = rival.aim is not None and rival.face_error > math.radians(self.phys("front_arc_deg", 180)) / 2
+            finish = rival.hp < (400 if equipped else 230) and rival.dist < 95
+            immediate = rival.attacker or rival in threats and rival.dist < 75
+            good_angle = rear and pressure <= 1 and rival.dist <= self.opportunity_range and p.fraction > 0.53
+            advantage = p.fraction - rival.hp / rival.max_hp
+            if equipped and len(rival.armed) < 2:
+                advantage += 0.25
+            commit = (p.fraction >= self.commit_fraction and pressure <= 1 and rival.dist < self.commit_range
+                      and advantage >= self.duel_advantage)
+            late = alive <= 2 or central or terminal
+            if (not rival.clear and not terminal and not (alive <= 2 and p.fraction > 0.82)
+                    or not (late or immediate or finish and pressure <= 1 or good_angle or commit)):
+                continue
+            value = self.target_merit(rival) + 17 * finish + 8 * rear + 19 * immediate
+            candidates.append((value, rival))
+        return [rival for _, rival in sorted(candidates, key=lambda item: item[0], reverse=True)]
+
+    def ffa_disengage(self, p, zone, threats, sound):
+        toward = bearing(zone.next_center, p.pos)
+        if threats:
+            away = [(p.pos[0] - c.pos[0], p.pos[1] - c.pos[1], max(c.dist, 6)) for c in threats[:4]]
+            toward = math.atan2(sum(y / d**2 for _, y, d in away), sum(x / d**2 for x, _, d in away))
+        elif sound is not None:
+            toward = angle(sound + math.pi)
+        radial = max(0, min(zone.next_radius * 0.55, distance(p.pos, zone.next_center) - 4))
+        staging = (zone.next_center[0] + radial * math.cos(bearing(zone.next_center, p.pos)),
+                   zone.next_center[1] + radial * math.sin(bearing(zone.next_center, p.pos)))
+        if not threats and sound is None:
+            return p.pos[:2] if distance(p.pos, staging) < 6 else staging
+        for turn in (0, 0.65, -0.65, 1.3, -1.3):
+            point = (p.pos[0] + 25 * math.cos(toward + turn), p.pos[1] + 25 * math.sin(toward + turn))
+            if zone.gap(point, 4) > 5:
+                return point
+        return staging
+
+
+class FinalBot(FreeForAllBot):
+    repair_fraction = 0.63
+    opportunity_range = 170
+    commit_fraction = 0.67
+    commit_range = 143
+    duel_advantage = -0.10
+
+    def act(self, obs):
+        obs = obj(obs)
+        if number(obs.get("alive"), 16) <= 7 or number(obj(obs.get("zone")).get("next_radius"), 560) <= 36:
+            return super().act(obs)
+        me = obj(obs.get("self"))
+        pos = vec(me.get("pos"), 3)
+        if pos is not None and number(me.get("hp")) > 0.75 * number(me.get("max_hp"), 1400):
+            for row in seq(obs.get("mechs"))[:48]:
+                row = obj(row)
+                aim, point = vec(row.get("aim"), 2), vec(row.get("pos"), 3)
+                if (row.get("kind") == "mech" and 0 < number(row.get("hp"), math.inf) < 275
+                        and point is not None and aim is not None and distance(pos, point) < 76
+                        and abs(angle(bearing(point, pos) - aim[0])) > math.radians(self.phys("front_arc_deg", 180)) / 2):
+                    return super().act(obs)
+        return Bot.act(self, obs)
+
+    def ffa_range_band(self, p, target):
+        low, high = self.range_band(p, target)
+        if any(w.get("kind") == "lightning" for w in p.weapons):
+            return low, high
+        return low * 1.26, high * 1.38
 
 
 class MatchMode:
@@ -1998,15 +2096,15 @@ class MatchMode:
         return self.mode
 
 
-class AutoBot(PracticeBot):
+class AutoBot(FinalBot):
     def __init__(self, hello):
         super().__init__(hello)
         self.detector = MatchMode(hello)
 
     def act(self, obs):
         if self.detector.update(obs) == "practice":
-            return super().act(obs)
-        return Bot.act(self, obs)
+            return PracticeBot.act(self, obs)
+        return super().act(obs)
 
 
 if __name__ == "__main__":
