@@ -16,6 +16,7 @@ from example_bot import obj, seq, number, vec, distance, bearing, angle
 import math
 
 SEED = 1                    # the only source of randomness; a different value is a different draw
+EARLY_WINDOW_S = 10.0
 FORCE_MODE = None           # None = detect; "practice" or "free-for-all" pins the policy
 GUARDED_OPENER = True       # squad play fights only mechs that attack or close on us
 
@@ -152,6 +153,19 @@ class Selective:
     def act(self, obs):
         obs = obj(obs)
         now = number(obs.get("t"), 0)
+        if getattr(self, "quiet_hold", False):
+            return {"move": [0.0, 0.0], "fire": [False, False]}
+        if now <= EARLY_WINDOW_S:
+            for snd in seq(obs.get("sounds"))[:40]:
+                snd = obj(snd)
+                b = number(snd.get("bearing"), None)
+                if snd.get("kind") in ("gun", "laser", "lightning", "explosion", "mortar") and snd.get("dist") != "near" and b is not None:
+                    self.early_n = getattr(self, "early_n", 0) + 1
+                    self.early_s = getattr(self, "early_s", set()) | {int(((b + math.pi) % (2 * math.pi)) // (math.pi / 4))}
+            if getattr(self, "early_n", 0) >= 3 and len(getattr(self, "early_s", ())) >= 1:
+                self.quiet_hold = True
+                mf.log(f"hold at {now:.1f}s")
+                return {"move": [0.0, 0.0], "fire": [False, False]}
         errors = (ArithmeticError, LookupError, TypeError, ValueError, AttributeError)
         try:
             a_safe = self.safe.act(obs)
@@ -181,7 +195,7 @@ class Royale:
 
     def __getattr__(self, name):
         # Tools and tests that inspect the policy see the active one.
-        if name in ("practice", "ffa", "detector", "mode", "first_ffa"):
+        if name in ("practice", "ffa", "detector", "mode", "first_ffa", "quiet_hold", "early_n", "early_s"):
             raise AttributeError(name)
         return getattr(self.ffa if self.mode == "free-for-all" else self.practice, name)
 
@@ -193,6 +207,19 @@ class Royale:
     def act(self, obs):
         obs = obj(obs)
         now = number(obs.get("t"), 0)
+        if getattr(self, "quiet_hold", False):
+            return {"move": [0.0, 0.0], "fire": [False, False]}
+        if now <= EARLY_WINDOW_S:
+            for snd in seq(obs.get("sounds"))[:40]:
+                snd = obj(snd)
+                b = number(snd.get("bearing"), None)
+                if snd.get("kind") in ("gun", "laser", "lightning", "explosion", "mortar") and snd.get("dist") != "near" and b is not None:
+                    self.early_n = getattr(self, "early_n", 0) + 1
+                    self.early_s = getattr(self, "early_s", set()) | {int(((b + math.pi) % (2 * math.pi)) // (math.pi / 4))}
+            if getattr(self, "early_n", 0) >= 3 and len(getattr(self, "early_s", ())) >= 1:
+                self.quiet_hold = True
+                mf.log(f"hold at {now:.1f}s")
+                return {"move": [0.0, 0.0], "fire": [False, False]}
         if FORCE_MODE is None:
             try:
                 want = "free-for-all" if self.detector.update(obs, now) else "practice"
