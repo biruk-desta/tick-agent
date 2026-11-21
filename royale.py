@@ -17,7 +17,7 @@ eb.PLAN_BUDGET_S = 0.010
 eb.ROUTE_SLICE_S = 0.004
 from example_bot import obj, seq, number, vec, distance, bearing, angle, limit, raised
 
-SEED = 6                    # practice random stream seed
+SEED = 2                    # practice random stream seed
 P_DRIVER = 3                # 1 = legacy practice, 2 = practice2, 3 = practice3
 FORCE_MODE = None           # None = detect; "practice" or "free-for-all" pins the policy
 GUARDED_OPENER = True       # squad play fights only mechs that attack or close on us
