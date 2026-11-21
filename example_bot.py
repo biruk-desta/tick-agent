@@ -46,6 +46,9 @@ WEAK_FRACTION = 0.32
 HIT_MEMORY_S = 3.2
 SOUND_MEMORY_S = 1.3
 CUBE_DETOUR_M = 38.0
+CUBE_STAT_VALUE_M = 39.0
+CUBE_UPGRADE_VALUE_M = 12.0
+CUBE_UPGRADE_DISCOUNT = 0.22
 WEAPON_DETOUR_M = 29.0
 DROP_DETOUR_M = 48.0
 CRATE_RANGE_M = 52.0
@@ -62,6 +65,7 @@ CORE_SLOW_M = 3.0
 HOLD_M = 1.6
 CORE_HOLD_M = 0.12
 BOOST_THREAT_M = 56.0
+SQUAD_EXPOSURE_PENALTY = 14.0
 ARMING_YAW_ALLOW_RAD = 0.12
 ARMING_PITCH_ALLOW_RAD = 0.10
 RELOAD_FRACTION = 0.60
@@ -455,11 +459,7 @@ class Bot:
         self.match_end = max(0, number(match.get("duration_s"), 480))
         self.slot = number(hello.get("slot"), 0)
         self.arena = None
-        directory = obj(hello.get("map")).get("dir")
-        if isinstance(directory, str) and directory and len(directory) < 2048:
-            self.arena = Arena(directory, number(self.mech.get("height"), 9),
-                               number(self.mech.get("step_up"), 1.2),
-                               math.tan(math.radians(limit(number(self.mech.get("max_slope_deg"), 50), 1, 80))))
+        self.map_dir = obj(hello.get("map")).get("dir")
         self.hits = {}
         self.drop_progress = {}
         self.last_damage = self.last_sound = -math.inf
@@ -473,6 +473,13 @@ class Bot:
         self.motion_time = self.stuck_until = -math.inf
         self.scout_yaw = self.slot * 1.7
         self.last_fire_target = None
+
+    def load_map(self):
+        directory = self.map_dir
+        if isinstance(directory, str) and directory and len(directory) < 2048:
+            slope = math.tan(math.radians(limit(self.phys("max_slope_deg", 50), 1, 80)))
+            self.arena = Arena(directory, self.phys("height", 9), self.phys("step_up", 1.2), slope)
+        return True
 
     def remember(self, obs, now):
         self.hits = {source: t for source, t in self.hits.items() if now - t < HIT_MEMORY_S}
@@ -675,6 +682,11 @@ class Bot:
         cube_cap = number(self.cubes.get("stat_cap"), 10)
         upgrade_gap = min((threshold - cubes for threshold in self.upgrade_thresholds if threshold > cubes),
                           default=math.inf)
+        stat_gain = limit(cube_cap - cubes, 0, 1)
+        # Discount progress toward distant offers, including after the stat cap.
+        upgrade_value = CUBE_UPGRADE_VALUE_M / (1 + CUBE_UPGRADE_DISCOUNT * max(0, upgrade_gap - 1))
+        cube_value = CUBE_STAT_VALUE_M * stat_gain + upgrade_value
+        cube_reach = limit(number(self.cubes.get("pickup_radius"), 3.5), 0.5, 15)
         own_id = number(obj(obs.get("self")).get("id"), self.slot)
         for key, bound, maximum in (("cubes", 56, CUBE_DETOUR_M), ("drops", 8, DROP_DETOUR_M)):
             for entry in seq(obs.get(key))[:bound]:
@@ -686,12 +698,9 @@ class Bot:
                 if d > maximum or any(distance(rival, p) < LOOT_CONTEST_M for rival in rivals):
                     continue
                 if key == "cubes":
-                    if cubes >= cube_cap and (d > 7 or upgrade_gap > 3):
+                    score = cube_value - d
+                    if score <= 0 or d < cube_reach * 0.7:
                         continue
-                    reach = limit(number(self.cubes.get("pickup_radius"), 3.5), 0.5, 15)
-                    if d < reach * 0.7:
-                        continue
-                    score = 51 - d
                 else:
                     holder = entry.get("holder")
                     if number(entry.get("lands_in"), math.inf) > 0 or (holder is not None and holder != own_id):
@@ -796,6 +805,18 @@ class Bot:
         if arena is not None:
             probe = pos[0] + dx * (radius + 3), pos[1] + dy * (radius + 3), pos[2]
             clear_forward = not arena.obstacle(probe, radius, height, 0.9)
+        steering_threats = threats[:3]
+        concealed_muzzle = None
+        if (SQUAD_EXPOSURE_PENALTY > 0 and arena is not None and evade and in_zone and not urgent and not hazards
+                and zone.gap(pos, 4) > pace * horizon + 2):
+            squad = [c for c in steering_threats if c.kind == "mech"]
+            if len(squad) >= 2:
+                for c in squad:
+                    if not c.clear:
+                        muzzle = raised(c.pos, 7 * c.scale)
+                        if not arena.clear_ray(muzzle, raised(pos, height * 0.65)):
+                            concealed_muzzle = muzzle
+                            break
         evaluation_angles = (0, 0.40, -0.40, 0.92, -0.92) if core and clear_forward else STEER_ANGLES
         for offset in evaluation_angles:
             if time.perf_counter() >= until:
@@ -822,7 +843,10 @@ class Bot:
                 if drop_hint is not None and progress > 0:
                     if not arena.clear_ray(raised(drop_hint, 7), raised(endpoint, height * 0.65)):
                         score += 2
-            for c in threats[:3]:
+                # Keep a wall between us and a second mech while disengaging.
+                if concealed_muzzle is not None and arena.clear_ray(concealed_muzzle, raised(endpoint, height * 0.65)):
+                    score -= SQUAD_EXPOSURE_PENALTY
+            for c in steering_threats:
                 delta = distance(endpoint, c.pos) - distance(pos, c.pos)
                 score += delta * (0.8 if c.dist < 36 else 0.45)
                 if c.clear and arena is not None and not wall:
@@ -854,11 +878,11 @@ class Bot:
                 jet = True
         return {"move": list(move), "boost": (sprint and grounded and not jump) or jet, "jump": jump}
 
-    def target(self, obs, pos, contacts, fraction, zone, urgent, safe, terminal_burn, repairing, incoming):
+    def target(self, obs, pos, contacts, fraction, zone, must_move, safe, terminal_burn, repairing, incoming):
         targets = []
         alive = number(obs.get("alive"), 16)
         duel = alive == 2
-        quiet = (not urgent and not incoming and zone.now - self.last_damage >= HIT_MEMORY_S
+        quiet = (not must_move and not incoming and zone.now - self.last_damage >= HIT_MEMORY_S
                  and (duel or zone.now - self.last_sound >= SOUND_MEMORY_S))
         nearby_rivals = {c.id for c in contacts if c.kind == "mech" and c.clear and c.dist < LOOT_THREAT_M}
         front_half_arc = math.radians(limit(self.phys("front_arc_deg", 180), 0, 360)) / 2
@@ -868,14 +892,14 @@ class Bot:
             weak = c.hp < min(c.max_hp * WEAK_FRACTION, 430)
             rear = c.aim is not None and c.face_error > front_half_arc
             if c.kind == "npc":
-                allowed = c.attacker and c.dist < 58 and (not urgent or c.dist < 27)
+                allowed = c.attacker and c.dist < 58 and (not must_move or c.dist < 27)
                 allowed |= safe and not repairing and c.dist < 62 and (weak or (fraction > 0.88 and c.dist > 35))
                 merit = 26 + 35 * c.attacker + 22 * weak
             else:
                 active = c.face_error < 0.45 and c.dist < (105 if c.charging else 46)
-                finishing = (fraction > HEAL_FRACTION and not urgent and weak and c.dist < (112 if rear else 68)
+                finishing = (fraction > HEAL_FRACTION and not must_move and weak and c.dist < (112 if rear else 68)
                              and (not repairing or c.hp <= 115))
-                busy = rear and c.charging and c.dist < 64 and fraction > 0.84 and not urgent and not repairing
+                busy = rear and c.charging and c.dist < 64 and fraction > 0.84 and not must_move and not repairing
                 endgame = (duel and terminal_burn) or (alive <= 3 and zone.radius < 31 and c.dist < 36)
                 opportunity = (quiet and nearby_rivals.issubset((c.id,))
                                and (duel or (rear and c.dist < 112))
@@ -886,7 +910,7 @@ class Bot:
                 merit = 48 + 55 * c.attacker + 40 * active + 25 * weak + 14 * rear + 19 * endgame
             if allowed:
                 targets.append((merit - c.dist * 0.26 + 8 * (c.id == self.last_fire_target), c))
-        if safe and not urgent and not repairing and fraction > HEAL_FRACTION:
+        if safe and not must_move and not repairing and fraction > HEAL_FRACTION:
             for item in seq(obs.get("crates"))[:36]:
                 item = obj(item)
                 p, ident = vec(item.get("pos"), 3), number(item.get("id"), None)
@@ -964,7 +988,7 @@ class Bot:
         vertical = math.atan2(max(0.70, height * 0.37), max(1.0, horizontal))
         return yaw, limit(pitch, *pitch_bounds), tolerance, vertical
 
-    def combat(self, obs, pos, weapons, actual, stats, contacts, safe, urgent, evade, energy, fraction, zone,
+    def combat(self, obs, pos, weapons, actual, stats, contacts, safe, must_move, evade, energy, fraction, zone,
                action, until, terminal_burn, repairing, incoming):
         muzzle = self.phys("muzzle_height", 7, stats)
         pitch_bounds = self.phys("min_pitch", -0.7, stats), self.phys("max_pitch", 1.3, stats)
@@ -973,9 +997,9 @@ class Bot:
         selected = None
         best = -math.inf
         evacuating = (not terminal_burn and
-                      (urgent and (zone.radius > DEATH_CIRCLE_M or math.hypot(*action["move"]) > 0.35)
-                       or action.get("boost") or (evade and fraction < HEAL_FRACTION)))
-        targets = self.target(obs, pos, contacts, fraction, zone, urgent, safe, terminal_burn, repairing, incoming)
+                      (must_move or action.get("boost") or (evade and fraction < HEAL_FRACTION)
+                       or (zone.radius <= DEATH_CIRCLE_M and math.hypot(*action["move"]) > 0.35)))
+        targets = self.target(obs, pos, contacts, fraction, zone, must_move, safe, terminal_burn, repairing, incoming)
         for merit, target in targets:
             for i, weapon in enumerate(weapons):
                 if time.perf_counter() >= until:
@@ -985,7 +1009,7 @@ class Bot:
                     continue
                 if kind == "gun" and (number(weapon.get("reload")) > 0 or number(weapon.get("ammo"), 1) <= 0):
                     continue
-                if kind == "lightning" and energy < BOOST_RESERVE + (8 if urgent else 0):
+                if kind == "lightning" and energy < BOOST_RESERVE + (8 if must_move else 0):
                     continue
                 charge = number(weapon.get("charge"))
                 if kind == "laser" and evacuating and charge <= 0:
@@ -1169,7 +1193,9 @@ class Bot:
                 direction = angle(self.scout_yaw + now * SCAN_RATE)
         action["aim"] = [direction, 0.0]
         if time.perf_counter() < until:
-            self.combat(obs, pos, weapons, actual, stats, contacts, safe, urgent, evade, energy, fraction, zone,
+            # Small-circle steering still centers the mech when holding is safe.
+            must_move = urgent and (not in_zone or size > DEATH_CIRCLE_M or zone.gap(pos, STEER_HORIZON_S) < 0)
+            self.combat(obs, pos, weapons, actual, stats, contacts, safe, must_move, evade, energy, fraction, zone,
                         action, until, terminal_burn, repairing, bool(hazards))
         return action
 

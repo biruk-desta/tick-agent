@@ -11,7 +11,7 @@
 
 What run() does for you (protocol.md section 2):
 - answers `hello` with `ready` (your class's `name`), then calls act() for each observation;
-- if observations queue up, answers only the newest one;
+- if observations queue up, answers the newest one in a bounded input batch;
 - sets `tick` on your action (you don't have to);
 - bounds incoming lines and decision time, with map-free steering on failure;
 - exits on `end`.
@@ -37,6 +37,8 @@ except ImportError:  # Python < 3.11: only type checkers read it (annotations ar
     pass
 
 MAX_LINE = 64 * 1024
+INPUT_DRAIN_S = 0.004
+INPUT_FRAME_LIMIT = 8
 DECISION_LIMIT_S = 0.014
 WRITE_RESERVE_S = 0.002
 INIT_LIMIT_S = 6.0
@@ -539,8 +541,8 @@ def _lines(fd):
             else:
                 pending.clear()
                 discarding = True
-        if not select.select([fd], [], [], 0)[0]:
-            yield None, None
+        # Give the caller a deadline check even in the middle of an oversized line.
+        yield None, received if select.select([fd], [], [], 0)[0] else None
 
 
 def _decision(bot, obs, tick):
@@ -562,31 +564,42 @@ def run(make_bot: Any) -> None:
     handshaken = False
     last_tick = -2
     latest = None
+    batch_start = None
+    frames = 0
     for raw, received in _lines(sys.stdin.fileno()):
         if raw is not None:
             try:
                 msg = json.loads(raw)
             except (ValueError, RecursionError):
-                continue
-            if not isinstance(msg, dict):
-                continue
-            kind = msg.get("type")
-            if kind == "hello" and not handshaken:
-                handshaken = True
-                bot = _watched(INIT_LIMIT_S, make_bot, msg)
-                if bot is None:
-                    log("Bot initialization failed. Using map-free steering.")
-                _send(stdout, b'{"type":"ready"}\n', time.perf_counter() + DECISION_LIMIT_S)
-            elif kind == "obs":
-                latest = msg, received
-            elif kind == "end":
-                return
-            continue
+                msg = None
+            if isinstance(msg, dict):
+                kind = msg.get("type")
+                if kind == "hello" and not handshaken:
+                    handshaken = True
+                    bot = _watched(INIT_LIMIT_S, make_bot, msg)
+                    if bot is None:
+                        log("Bot initialization failed. Using map-free steering.")
+                    load_map = getattr(bot, "load_map", None)
+                    if load_map is not None and _watched(INIT_LIMIT_S, load_map) is None:
+                        log("Arena unavailable. Using the full policy without map routing.")
+                    _send(stdout, b'{"type":"ready"}\n', time.perf_counter() + DECISION_LIMIT_S)
+                elif kind == "obs":
+                    if latest is None:
+                        batch_start = received
+                    latest = msg
+                elif kind == "end":
+                    return
         if latest is None:
             continue
-        obs, received = latest
+        if raw is not None:
+            frames += 1
+        if (received is not None and frames < INPUT_FRAME_LIMIT
+                and time.perf_counter() < batch_start + INPUT_DRAIN_S):
+            continue
+        obs = latest
         latest = None
-        deadline = received + DECISION_LIMIT_S
+        frames = 0
+        deadline = batch_start + DECISION_LIMIT_S
         tick = obs.get("tick")
         if type(tick) not in (int, float) or not -1e15 <= tick <= 1e15 or not math.isfinite(tick):
             tick = last_tick + 2
