@@ -1036,7 +1036,7 @@ class Bot:
         return yaw, limit(pitch, *pitch_bounds), tolerance, vertical
 
     def combat(self, obs, pos, weapons, actual, stats, contacts, safe, must_move, evade, energy, fraction, zone,
-               action, until, terminal_burn, repairing, incoming):
+               action, until, terminal_burn, repairing, incoming, *, early_laser=None):
         muzzle = self.phys("muzzle_height", 7, stats)
         pitch_bounds = self.phys("min_pitch", -0.7, stats), self.phys("max_pitch", 1.3, stats)
         firing = [False, False]
@@ -1100,7 +1100,10 @@ class Bot:
                 defaults = obj(self.weapon_config.get("laser"))
                 charged = number(obj(weapon.get("stats")).get("charge"), number(defaults.get("charge"), 0.75))
                 if charge > 0:
-                    firing[index] = not (evacuating or (aligned and charge >= charged - self.physics_dt))
+                    firing[index] = not (evacuating or (aligned and (
+                        charge >= charged - self.physics_dt
+                        or (early_laser is not None and early_laser(obs, weapon, target, charge, charged))
+                    )))
                 elif cooldown <= self.physics_dt and aligned:
                     firing[index] = True
             elif cooldown <= self.dt + 0.025:

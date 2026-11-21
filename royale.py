@@ -233,7 +233,7 @@ class Selective(eb.Bot):
 
     def __init__(self, hello):
         super().__init__(hello)
-        self.duel = duel_bot.DuelBot(hello)
+        self.duel = duel_bot.DuelBot(hello, practice_variants=False)
         self.pickups = {}
         self.visible_pickups = {}
         self.last_seen = {}

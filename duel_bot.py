@@ -9,7 +9,13 @@ import time
 
 import mechfight as mf
 import example_bot as eb
-from example_bot import (Bot, Contact, Zone, ZERO, obj, seq, number, vec, limit, angle, bearing, distance)
+from example_bot import (Bot, Contact, Zone, ZERO, obj, seq, number, vec, limit, angle, bearing, distance, raised)
+
+P_STEADY_STRAFE = False
+P_SIGHTLINE = False
+P_FINISH = False
+P_EARLY_LASER = False
+P_REPAIR_HIDDEN = False
 
 SHELTER_SLICE_S = 0.006     # time caps are safety nets only: node and count limits should bind
 STEER_SLICE_S = 0.004
@@ -49,11 +55,13 @@ CRATE_FARM_M = 70.0
 
 
 class DuelBot(Bot):
-    def __init__(self, hello):
+    def __init__(self, hello, *, practice_variants=True):
         super().__init__(hello)
+        self.practice_variants = practice_variants
         self.rng = random.Random(int(SEED_SALT) * 1000003 + int(number(hello.get("seed"), 0)))
         self.strafe_sign = 1 if self.rng.random() < 0.5 else -1
         self.strafe_until = 0.0
+        self.wall_strafe_until = 0.0
         self.vel_avg = {}
         self.seen_hp = {}
         self.retreat_until = -math.inf
@@ -64,6 +72,8 @@ class DuelBot(Bot):
         self.last_seen = {}        # mech id -> (time, pos)
         self.kill_spot = None      # (time, pos) where a victim died
         self.hunt_point = None     # (time, pos) best guess of where a hunter is
+        self.repair_pending = self.repair_holding = False
+        self.repair_hidden_since = None
 
     # ------------------------------------------------------------------ targets
     def track(self, contacts):
@@ -125,6 +135,115 @@ class DuelBot(Bot):
         return c.dist < 140 and closing > 3.0 and facing
 
     # ----------------------------------------------------------------- movement
+    def fresh_mechs(self, obs):
+        """Use this observation's mech positions, including those outside the combat shortlist."""
+        own_id = number(obj(obs.get("self")).get("id"), self.slot)
+        size_per_cube = number(self.cubes.get("size_per_cube"), 0.05)
+        for raw in seq(obs.get("mechs"))[:48]:
+            actor = obj(raw)
+            if actor.get("kind") != "mech":
+                continue
+            ident = number(actor.get("id"), None)
+            if ident is None or ident == own_id or number(actor.get("hp"), 1) <= 0:
+                continue
+            point = vec(actor.get("pos"), 3)
+            if point is not None:
+                scale = 1 + limit(number(actor.get("cubes")), 0, 100) * size_per_cube
+                yield ident, point, scale
+
+    def enemy_has_line(self, point, scale, body):
+        return self.arena is None or self.arena.clear_ray(raised(point, self.phys("muzzle_height", 7) * scale), body)
+
+    def sightline_move(self, move, obs, pos, foe, zone, radius, height, muzzle):
+        arena = self.arena
+        if arena is None:
+            return move
+        others = [(point, scale) for ident, point, scale in self.fresh_mechs(obs)
+                  if ident != foe.id and math.dist(point, pos) <= 170]
+        if not others:
+            return move
+        course = math.atan2(move[1], move[0])
+        target = raised(foe.pos, self.phys("height", 9) * foe.scale * 0.53)
+        best, fewest = move, len(others) + 1
+        for delta in (0, math.pi / 4, -math.pi / 4):
+            dx, dy = math.cos(course + delta), math.sin(course + delta)
+            step = pos[0] + 6 * dx, pos[1] + 6 * dy, pos[2]
+            if zone.gap((pos[0] + 12 * dx, pos[1] + 12 * dy), 3) < 2:
+                continue
+            if not arena.corridor(pos, step, radius, height):
+                continue
+            if not arena.clear_ray(raised(step, muzzle), target):
+                continue
+            body = raised(step, height * 0.58)
+            exposed = sum(self.enemy_has_line(point, scale, body) for point, scale in others)
+            if exposed < fewest:
+                best, fewest = (move if delta == 0 else [dx, dy]), exposed
+                if fewest == 0:
+                    break
+        return best
+
+    def finishing_range(self, obs, pos, foe, kinds, fraction, eye):
+        if not (foe.clear and foe.dist <= 120 and 0 < foe.hp < 0.38 * foe.max_hp and fraction > 0.55):
+            return None
+        if not kinds.intersection(("gun", "laser", "lightning")):
+            return None
+        origin = raised(pos, eye)
+        for ident, point, scale in self.fresh_mechs(obs):
+            if ident != foe.id and math.dist(point, pos) <= 160:
+                body = raised(point, self.phys("height", 9) * scale * 0.58)
+                if self.arena is None or self.arena.clear_ray(origin, body):
+                    return None
+        if "lightning" in kinds:
+            return 28.0
+        if "mortar" in foe.armed:
+            return 80.0
+        if "lightning" in foe.armed:
+            return 64.0
+        return 55.0
+
+    def early_laser(self, obs, weapon, target, charge, full_charge):
+        if target.kind != "mech" or not (0 < target.hp < math.inf):
+            return False
+        stats = obj(weapon.get("stats"))
+        defaults = obj(self.weapon_config.get("laser"))
+        minimum = number(stats.get("min_charge"), number(defaults.get("min_charge"), 0.15))
+        if charge < minimum:
+            return False
+        damage = number(stats.get("damage"), number(defaults.get("damage"), 315))
+        min_frac = limit(number(stats.get("min_frac"), number(defaults.get("min_frac"), 0.35)), 0, 1)
+        charge_frac = limit(charge / max(full_charge, self.physics_dt), 0, 1)
+        cube_cap = max(0, number(self.cubes.get("stat_cap"), 10))
+        cubes = limit(number(obj(obs.get("self")).get("cubes")), 0, cube_cap)
+        cube_bonus = 1 + cubes * number(self.cubes.get("damage_per_cube"), 0.04)
+        return 0.8 * damage * (min_frac + (1 - min_frac) * charge_frac) * cube_bonus >= target.hp
+
+    def hidden_repair(self, obs, pos, height, now, fraction, retreating, killed, damaged, must_move):
+        if must_move or fraction >= REPAIR_TO:
+            self.repair_pending = self.repair_holding = False
+            self.repair_hidden_since = None
+            return False
+        if not self.repair_holding and fraction >= 0.55:
+            self.repair_pending = False
+            self.repair_hidden_since = None
+            return False
+        if retreating or killed:
+            self.repair_pending = True
+        body = raised(pos, height * 0.58)
+        if self.repair_holding:
+            if damaged or any(math.dist(point, pos) <= 30 and self.enemy_has_line(point, scale, body)
+                              for _, point, scale in self.fresh_mechs(obs)):
+                self.repair_pending = self.repair_holding = False
+                self.repair_hidden_since = None
+            return self.repair_holding
+
+        if damaged or any(self.enemy_has_line(point, scale, body) for _, point, scale in self.fresh_mechs(obs)):
+            self.repair_hidden_since = None
+        elif self.repair_hidden_since is None:
+            self.repair_hidden_since = now
+        elif self.repair_pending and now - self.repair_hidden_since >= 1.0:
+            self.repair_holding = True
+        return self.repair_holding
+
     def desired_range(self, kinds, foe):
         theirs = {k for k in foe.armed if k in KNOWN_WEAPONS}
         if "lightning" in kinds:
@@ -154,12 +273,18 @@ class DuelBot(Bot):
                 return c
         return course
 
-    def engage_move(self, pos, foe, kinds, zone, now, radius, height, energy, hp_fraction, hunters):
+    def engage_move(self, pos, foe, kinds, zone, now, radius, height, energy, hp_fraction, hunters, *, finish_range=None):
         d = distance(pos, foe.pos)
-        want = self.desired_range(kinds, foe)
+        want = self.desired_range(kinds, foe) if finish_range is None else finish_range
+        steady_strafe = self.practice_variants and P_STEADY_STRAFE
         if now >= self.strafe_until:
-            self.strafe_sign = -self.strafe_sign if self.rng.random() < 0.8 else self.strafe_sign
-            self.strafe_until = now + self.rng.uniform(STRAFE_MIN_S, STRAFE_MAX_S)
+            if steady_strafe:
+                if self.strafe_until != 0:
+                    self.strafe_sign = -self.strafe_sign
+                self.strafe_until = now + self.rng.uniform(3, 5)
+            else:
+                self.strafe_sign = -self.strafe_sign if self.rng.random() < 0.8 else self.strafe_sign
+                self.strafe_until = now + self.rng.uniform(STRAFE_MIN_S, STRAFE_MAX_S)
         to_me = bearing(foe.pos, pos)
         radial = limit((d - want) / 12.0, -1.0, 1.0)           # >0: too far, close in
         if foe.charging and foe.aim is not None and d > 25 and abs(angle(foe.aim[0] - bearing(foe.pos, pos))) < 0.2:
@@ -181,9 +306,15 @@ class DuelBot(Bot):
             self.strafe_sign = -self.strafe_sign
             course = bearing(pos, zone.next_center)
         free = self.free_dir(pos, course, radius, height)
-        if abs(angle(free - course)) > 1.2 and now >= self.strafe_until - 0.25:
+        wall_flip_at = self.wall_strafe_until if steady_strafe else self.strafe_until - 0.25
+        if abs(angle(free - course)) > 1.2 and now >= wall_flip_at:
             self.strafe_sign = -self.strafe_sign
-            self.strafe_until = now + self.rng.uniform(0.35, 0.9)
+            wall_hold = now + self.rng.uniform(0.35, 0.9)
+            if steady_strafe:
+                self.wall_strafe_until = wall_hold
+                self.strafe_until = max(self.strafe_until, wall_hold)
+            else:
+                self.strafe_until = wall_hold
         boost = (energy > 45 and (d > want + 25 or (foe.clear and foe.dist < 90 and "lightning" not in kinds))
                  or self.dodging and energy > 15)
         return [math.cos(free), math.sin(free)], boost
@@ -255,13 +386,17 @@ class DuelBot(Bot):
         for c in contacts:
             if c.kind == "mech":
                 self.last_seen[c.id] = (now, c.pos)
+        killed = damaged = False
         for event in seq(obs.get("events"))[:40]:
             event = obj(event)
             if event.get("type") == "kill":
+                killed = True
                 victim = number(event.get("target"), None)
                 seen = self.last_seen.get(victim)
                 if seen is not None:
                     self.kill_spot = (now, seen[1])
+            elif event.get("type") == "damaged":
+                damaged = True
         self.update_hunt_point(obs, pos, now)
         items = seq(me.get("weapons"))
         weapons = [obj(items[i]) if i < len(items) else {} for i in range(2)]
@@ -289,6 +424,14 @@ class DuelBot(Bot):
             self.retreat_until = -math.inf   # finish it
         retreating = now < self.retreat_until or (len(visible) >= 3 and fraction < 0.6)
 
+        if self.practice_variants and P_REPAIR_HIDDEN and self.hidden_repair(
+                obs, pos, height, now, fraction, retreating and foe is not None, killed, damaged,
+                urgent or terminal_burn or not in_zone):
+            self.mode = "hidden-repair"
+            self.last_fire_target = None
+            action.update(move=[0.0, 0.0], boost=False, fire=[False, False], aim=list(actual))
+            return action
+
         move = None
         boost = False
         self.mode = "roam"
@@ -296,8 +439,12 @@ class DuelBot(Bot):
             goal = self.arena.inset(goal, radius + 0.4)
         if not urgent and foe is not None and not retreating and not terminal_burn:
             self.mode = "duel"
-            move, boost = self.engage_move(pos, foe, kinds, zone, now, radius, height, energy, fraction, hunters)
-            cube = self.cube_goal(obs, pos, zone, FIGHT_CUBE_M) if fraction > RETREAT_FRACTION else None
+            finish_range = (self.finishing_range(obs, pos, foe, kinds, fraction, eye)
+                            if self.practice_variants and P_FINISH else None)
+            move, boost = self.engage_move(pos, foe, kinds, zone, now, radius, height, energy, fraction, hunters,
+                                           finish_range=finish_range)
+            cube = (self.cube_goal(obs, pos, zone, FIGHT_CUBE_M)
+                    if fraction > RETREAT_FRACTION and finish_range is None else None)
             if cube is not None:
                 # Kill cubes heal and add damage: walk onto them mid-fight, still aiming at the foe.
                 self.mode = "duel-cube"
@@ -310,6 +457,9 @@ class DuelBot(Bot):
                                       min(until, time.perf_counter() + eb.ROUTE_SLICE_S))
                 c = bearing(pos, waypoint)
                 move = [math.cos(c), math.sin(c)]
+            if self.practice_variants and P_SIGHTLINE and foe.clear and not self.dodging and not hazards:
+                move = self.sightline_move(move, obs, pos, foe, zone, radius, height,
+                                           self.phys("muzzle_height", 7, stats))
         elif not urgent and retreating and foe is not None and not terminal_burn:
             self.mode = "retreat"
             direction = bearing(pos, foe.pos)
@@ -405,8 +555,9 @@ class DuelBot(Bot):
         action["aim"] = [direction, 0.0]
         if time.perf_counter() < until + 0.002:
             boosting = action.pop("boost", False)
+            early_laser = self.early_laser if self.practice_variants and P_EARLY_LASER else None
             self.combat(obs, pos, weapons, actual, stats, contacts, True, urgent, False, energy, 1.0, zone,
-                        action, until + 0.002, terminal_burn, False, bool(hazards))
+                        action, until + 0.002, terminal_burn, False, bool(hazards), early_laser=early_laser)
             charging = any(f and w.get("kind") == "laser" for f, w in zip(action.get("fire", ()), weapons))
             action["boost"] = bool(boosting) and not charging
         return action
