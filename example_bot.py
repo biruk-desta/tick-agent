@@ -1244,6 +1244,10 @@ class Pilot:
 
 
 class PracticeBot(Bot):
+    crossfire_spacing = 1.0
+    crossfire_repair = 0.74
+    crossfire_dodge = 3.8
+
     def __init__(self, hello):
         super().__init__(hello)
         seed = hello.get("seed")
@@ -1624,17 +1628,22 @@ class PracticeBot(Bot):
 
     def strafe_move(self, p, zone, target, threats, retreat, hazards, until, terminal, central, free_for_all=False):
         now = zone.now
+        under_wave = not free_for_all and (self.hunter_count >= 2 or bool(self.kill_sites))
         if now >= self.stride_until or self.duel_target != target.id:
             self.duel_target = target.id
-            self.stride_until = now + self.rng.uniform(0.41, 1.04)
+            self.stride_until = now + (self.rng.uniform(0.25, 0.53) if under_wave else self.rng.uniform(0.41, 1.04))
             self.strafe = -self.strafe if self.rng.random() < 0.81 else self.strafe
             self.stride = self.rng.uniform(0.74, 1.38)
             self.sprint = self.rng.random() < 0.44
         course = bearing(p.pos, target.pos)
         low, high = self.ffa_range_band(p, target) if free_for_all else self.range_band(p, target)
+        crossfire = (under_wave and not central and not terminal and len(threats) >= 2)
+        flankers = [c for c in threats[:4] if c.id != target.id] if crossfire else []
         radial = limit((target.dist - (low + high) / 2) / max(8, (high - low) * 0.65), -1.8, 1.8)
-        if retreat:
+        if retreat and not flankers:
             radial = -1.35
+        elif flankers and retreat:
+            radial = min(radial, -0.4) if target.dist < high else radial
         tangent = self.strafe * self.stride
         if target.aim is not None:
             facing = angle(bearing(target.pos, p.pos) - target.aim[0])
@@ -1642,6 +1651,11 @@ class PracticeBot(Bot):
                 # In our frame the tangent in the opposite direction increases the flank angle.
                 tangent -= math.copysign(0.30, facing)
         yaw = course + math.atan2(tangent, radial)
+        if flankers:
+            separation = sum(math.sin(angle(bearing(c.pos, p.pos) - course)) * max(0, 150 - c.dist)
+                             for c in flankers)
+            if abs(separation) > 18:
+                yaw = course + math.atan2(math.copysign(abs(tangent), separation), radial)
         boost = p.grounded and p.energy > (26 if retreat else 38) and (bool(hazards) or retreat or self.sprint)
         pace = p.boost if boost else p.walk
         if any(number(w.get("charge")) > 0 for w in p.weapons):
@@ -1659,6 +1673,13 @@ class PracticeBot(Bot):
             if arena is not None and not arena.corridor(p.pos, endpoint, p.radius, p.height):
                 continue
             score = -abs(offset) * 2.2
+            if flankers:
+                # Keep one rival within weapon range while making the other pursuers
+                # travel farther. In the open this still works without a wall to hide behind.
+                gain = sum(limit(distance(c.pos, endpoint) - c.dist, -10, 10)
+                           * limit((145 - c.dist) / 65, 0.25, 1) for c in flankers)
+                target_range = distance(target.pos, endpoint)
+                score += self.crossfire_spacing * (1.35 * gain - 0.24 * max(0, target_range - high))
             if not terminal:
                 score -= max(0, min(7, zone.radius * 0.3) - zone.gap(endpoint, 0.8)) * 4.4
                 if central:
@@ -1675,8 +1696,20 @@ class PracticeBot(Bot):
                     score += 5 * target_line
                 score += 0.20 * max(0, 15 - arena.near_cover(endpoint))
             for impact, seconds, reach in hazards:
-                future = p.pos[0] + dx * pace * seconds, p.pos[1] + dy * pace * seconds
-                score -= max(0, reach - distance(future, impact)) * 2.6
+                want = dx * pace, dy * pace
+                if under_wave:
+                    ax = want[0] - p.vel[0]
+                    ay = want[1] - p.vel[1]
+                    acceleration = self.phys("ground_accel", 58.5, p.stats) if p.grounded else self.phys("air_accel", 12, p.stats)
+                    ramp = math.hypot(ax, ay) / max(1, acceleration)
+                    elapsed = min(seconds, ramp)
+                    correction = elapsed * (1 - 0.5 * elapsed / max(1e-6, ramp))
+                    future = (p.pos[0] + want[0] * seconds - ax * correction,
+                              p.pos[1] + want[1] * seconds - ay * correction)
+                    score -= max(0, reach - distance(future, impact)) * self.crossfire_dodge
+                else:
+                    future = p.pos[0] + want[0] * seconds, p.pos[1] + want[1] * seconds
+                    score -= max(0, reach - distance(future, impact)) * 2.6
             if score > best:
                 best, move = score, (dx, dy)
         return {"move": list(move), "boost": boost, "jump": False}
@@ -1758,6 +1791,8 @@ class PracticeBot(Bot):
                       and self.match_end - now > repair_wait + 3)
         can_finish = target and target.clear and target.hp <= max(140, p.hp * 0.28)
         repair_start = self.repair_fraction if free_for_all and alive > 2 else 0.52
+        if not free_for_all and (squad or self.kill_sites) and self.hunter_count <= 3:
+            repair_start = self.crossfire_repair
         repair_end = 0.96 if free_for_all else 0.84
         self.repairing = can_repair and p.fraction < (repair_end if self.repairing else repair_start) and not can_finish
         engaged = target and (target.clear or target.id in self.pursuers or now - self.last_damage < 2)
@@ -1838,7 +1873,8 @@ class PracticeBot(Bot):
 
         # Hold the repair timer once we have broken contact. Emergency shots remain available
         # when a hunter has a clear line or we can end the fight quickly.
-        if self.repairing and not can_finish and not (target and target.clear and (cover is None or target.dist < 24)):
+        if self.repairing and not can_finish and not (target and target.clear and
+                (cover is None or target.dist < 24 or not free_for_all and exposed >= 2)):
             targets = []
         if not targets and not self.repairing and not urgent and loot is None and not terminal:
             targets = [c for c in contacts if c.kind == "npc" and c.clear and c.hp > 0 and
