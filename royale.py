@@ -22,7 +22,7 @@ FORCE_MODE = None           # None = detect; "practice" or "free-for-all" pins t
 GUARDED_OPENER = True       # squad play fights only mechs that attack or close on us
 PAUSE_MED_MS = 8.0
 PAUSE_MIN_MS = 4.0
-PAUSE_SHOW = True
+PAUSE_SHOW = False
 USE_PAUSE = False
 USE_E = True
 USE_R = True
