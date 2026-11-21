@@ -37,7 +37,8 @@ LASER_RANGE_M = 130.0
 REPAIR_TO = 0.85                # heal to this share before hunting the next one
 VEL_SMOOTH = 0.35          # weight of the newest velocity sample in the per-target average
 RETREAT_FRACTION = 0.30    # break contact below this health share when the duel is going badly
-NPC_FARM_M = 120.0
+NPC_FARM_M = 170.0          # walk to drones this far for their 2 cubes
+FARM_HP = 0.50              # farm drones and crates above this health share
 FIGHT_CUBE_M = 40.0
 GUN_RANGE_M = 90.0          # preferred gun-only duel range (simulator: dodging needs flight time)
 STRAFE_MIN_S = 0.3
@@ -80,7 +81,7 @@ class DuelBot(Bot):
 
     def target(self, obs, pos, contacts, fraction, zone, must_move, safe, terminal_burn, repairing, incoming):
         targets = []
-        farming_ok = self.hp_share >= 0.85
+        farming_ok = self.hp_share >= FARM_HP
         mechs = [c for c in contacts if c.kind == "mech"]
         for c in contacts:
             if c.kind == "mech" and self.guarded and not self.engaging_us(c, pos):
@@ -337,9 +338,13 @@ class DuelBot(Bot):
             cube = self.cube_goal(obs, pos, zone)
             if self.kill_spot is not None and (now - self.kill_spot[0] > 30 or distance(pos, self.kill_spot[1]) < 5):
                 self.kill_spot = None
+            drop = self.drop_goal(obs, pos, zone, walk)
             if cube is not None:
                 goal = cube
                 self.mode = "cube"
+            elif drop is not None:
+                goal = drop
+                self.mode = "drop"
             elif pickup is not None:
                 goal = pickup
                 self.mode = "loot"
@@ -350,7 +355,7 @@ class DuelBot(Bot):
                 goal = self.hunt_point[1][:2]
                 self.mode = "hunt"
             else:
-                farm = self.farm_goal(obs, pos, contacts, zone)
+                farm = self.farm_goal(obs, pos, contacts, zone) if fraction >= FARM_HP else None
                 if farm is not None:
                     goal = farm
                     self.mode = "farm"
@@ -442,6 +447,29 @@ class DuelBot(Bot):
             reach = {"near": 40, "mid": 100}.get(sound.get("dist"), 180)
             self.hunt_point = (now, (pos[0] + reach * math.cos(b), pos[1] + reach * math.sin(b), pos[2]))
             return
+
+    def drop_goal(self, obs, pos, zone, walk):
+        """A supply drop nobody else is capturing, reachable about when it lands: 3 cubes,
+        full health and energy for standing in its ring alone."""
+        me = number(obj(obs.get("self")).get("id"), self.slot)
+        best, goal = math.inf, None
+        for item in seq(obs.get("drops"))[:8]:
+            item = obj(item)
+            p = vec(item.get("pos"), 3)
+            if p is None:
+                continue
+            holder = item.get("holder")
+            if holder is not None and number(holder, -1) != me:
+                continue
+            d = distance(pos, p)
+            if d > 220 or number(item.get("lands_in"), 0) > d / max(walk, 1) + 3:
+                continue
+            if zone.gap(p, 15) < 4:
+                continue
+            ring = number(item.get("radius"), 8)
+            if d < best:
+                best, goal = d, (pos[:2] if d < ring - 3 else p[:2])
+        return goal
 
     def farm_goal(self, obs, pos, contacts, zone):
         best, goal = math.inf, None
