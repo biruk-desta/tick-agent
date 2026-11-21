@@ -1,0 +1,11 @@
+*
+!Dockerfile
+!bot.py
+!mechfight.py
+!arena_model.py
+!body_stats.py
+!navigation.py
+!navigation_cache.py
+!combat.py
+!match_policy.py
+!firstparty_movement.py
