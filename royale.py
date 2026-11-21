@@ -16,6 +16,7 @@ from example_bot import obj, seq, number, vec, distance, bearing, angle
 import math
 
 SEED = 1                    # the only source of randomness; a different value is a different draw
+QUIET_M, ARM_DETOUR_M, CUBE_QUIET_M = 150.0, 120.0, 100.0
 FORCE_MODE = None           # None = detect; "practice" or "free-for-all" pins the policy
 GUARDED_OPENER = True       # squad play fights only mechs that attack or close on us
 
@@ -153,10 +154,23 @@ class Selective:
         obs = obj(obs)
         now = number(obs.get("t"), 0)
         errors = (ArithmeticError, LookupError, TypeError, ValueError, AttributeError)
+        # Arm while it is quiet: with no mech within 150 m, walk up to 120 m for a laser or
+        # lightning and up to 100 m for cubes, so the last duels are not fought gun-only.
+        me = obj(obs.get("self"))
+        here = vec(me.get("pos"), 3)
+        nearest = min((distance(here, p) for e in seq(obs.get("mechs"))[:48]
+                       if obj(e).get("kind") == "mech" and (p := vec(obj(e).get("pos"), 3)) is not None),
+                      default=1e9) if here is not None else 0.0
+        saved = eb.WEAPON_DETOUR_M, eb.CUBE_DETOUR_M, eb.WEAPON_RANK
+        if nearest > QUIET_M:
+            eb.WEAPON_DETOUR_M, eb.CUBE_DETOUR_M = ARM_DETOUR_M, CUBE_QUIET_M
+            eb.WEAPON_RANK = duel_bot.DUEL_WEAPON_RANK
         try:
             a_safe = self.safe.act(obs)
         except errors:
             a_safe = None
+        finally:
+            eb.WEAPON_DETOUR_M, eb.CUBE_DETOUR_M, eb.WEAPON_RANK = saved
         try:
             a_duel = self.duel.act(obs)
         except errors:
