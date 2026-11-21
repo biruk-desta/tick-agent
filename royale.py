@@ -17,8 +17,8 @@ eb.PLAN_BUDGET_S = 0.010
 eb.ROUTE_SLICE_S = 0.004
 from example_bot import obj, seq, number, vec, distance, bearing, angle, limit, raised
 
-SEED = 6                    # practice2 random stream seed
-P_DRIVER = 2                # 1 = legacy practice, 2 = practice2
+SEED = 6                    # practice random stream seed
+P_DRIVER = 3                # 1 = legacy practice, 2 = practice2, 3 = practice3
 FORCE_MODE = None           # None = detect; "practice" or "free-for-all" pins the policy
 GUARDED_OPENER = True       # squad play fights only mechs that attack or close on us
 PAUSE_MED_MS = 8.0
@@ -1449,23 +1449,46 @@ class Royale:
         self.mode = FORCE_MODE or "practice"
         self.first_ffa = None
         self.practice2 = None
+        self.practice3 = None
         self.practice_fallbacks = 0
         if P_DRIVER == 2 and self.mode == "practice":
             from practice2 import Practice
             self.practice2 = Practice(hello, SEED)
+        if P_DRIVER == 3 and self.mode == "practice":
+            from practice3 import Practice
+            self.practice3 = Practice(hello, SEED)
 
     def __getattr__(self, name):
         # Tools and tests that inspect the policy see the active one.
-        if name in ("practice", "practice2", "ffa", "detector", "mode", "first_ffa"):
+        if name in ("practice", "practice2", "practice3", "ffa", "detector", "mode", "first_ffa"):
             raise AttributeError(name)
-        return getattr(self.ffa if self.mode == "free-for-all" else (self.practice2 or self.practice), name)
+        if self.mode == "free-for-all":
+            return getattr(self.ffa, name)
+        return getattr(self.practice2 or self.practice3 or self.practice, name)
 
     def load_map(self):
         if self.practice2 is not None:
             self.practice2.load_map()
         self.practice.load_map()
         self.ffa.arena = self.practice.arena
+        if self.practice3 is not None:
+            self.load_practice3_map()
         return True
+
+    def load_practice3_map(self):
+        from json import loads
+        from pathlib import Path
+
+        try:
+            directory = self.practice.map_dir
+            if isinstance(directory, str) and directory and len(directory) < 2048:
+                root = Path(directory) / "v2"
+                data = loads(eb.read_map_file(root / "world.json"))
+                self.practice3.load_map(data, eb.read_map_file(root / "terrain.i16"))
+            else:
+                self.practice3.load_map()
+        except Exception as error:
+            mf.log(f"practice3 map: {type(error).__name__}")
 
     def act(self, obs):
         obs = obj(obs)
@@ -1483,16 +1506,21 @@ class Royale:
         if self.mode == "free-for-all":
             return self.ffa.act(obs)
         self.ffa.record(obs, vec(obj(obs.get("self")).get("pos"), 3), now)
-        if self.practice2 is not None:
+        driver = self.practice2 or self.practice3
+        if driver is not None:
             try:
-                return self.practice2.act(obs)
+                action = driver.act(obs)
+                if driver is self.practice3:
+                    self.practice.remember(obs, now)
+                return action
             except Exception as error:
                 self.practice_fallbacks += 1
-                mf.log(f"practice2 fallback {self.practice_fallbacks}: {type(error).__name__}")
+                name = "practice3" if driver is self.practice3 else "practice2"
+                mf.log(f"{name} fallback {self.practice_fallbacks}: {type(error).__name__}")
                 try:
                     return self.practice.act(obs)
                 except Exception:
-                    return {"aim": self.practice2.last_aim}
+                    return {"aim": driver.last_aim}
         return self.practice.act(obs)
 
 
