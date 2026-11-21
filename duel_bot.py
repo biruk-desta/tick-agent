@@ -11,7 +11,7 @@ import mechfight as mf
 import example_bot as eb
 from example_bot import (Bot, Contact, Zone, ZERO, obj, seq, number, vec, limit, angle, bearing, distance, raised)
 
-P_STEADY_STRAFE = False
+P_STEADY_STRAFE = True
 P_SIGHTLINE = False
 P_FINISH = False
 P_EARLY_LASER = False
