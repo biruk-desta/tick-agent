@@ -25,6 +25,7 @@ PAUSE_MIN_MS = 4.0
 PAUSE_SHOW = False
 USE_PAUSE = False
 USE_E = True
+E_WINDOW_S = 30.0
 USE_R = True
 USE_H2 = True
 FFA_WEDGE = True
@@ -131,8 +132,8 @@ class Detector:
             if (others >= 2 and dps <= 35) or (others >= 3 and dps <= 100):
                 self.ffa, self.reason = True, f"{others} deaths not ours at {now:.1f}s (dps {dps:.0f})"
                 return True
-            if USE_E and others >= 1 and now < 150:
-                self.ffa, self.reason = True, f"death not ours before 150s at {now:.1f}s"
+            if USE_E and others >= 1 and now < E_WINDOW_S:
+                self.ffa, self.reason = True, f"death not ours before {E_WINDOW_S:g}s at {now:.1f}s"
                 return True
         if USE_R and self.other_hp_drop(obs, events):
             self.ffa, self.reason = True, f"other mech lost 45 HP at {now:.1f}s"
