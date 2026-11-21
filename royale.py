@@ -32,6 +32,8 @@ FFA_WEDGE = True
 FFA_NOT_NEAREST = True
 FFA_UNSEEN_OPEN = True
 FFA_QUIET_WALK = True
+FFA_PICKUP_TAPER = True
+FFA_LASER_COVER = True
 
 FFA_SIGHT_MEMORY_S = 3.0
 FFA_WEDGE_MARGIN = math.radians(10)
@@ -42,6 +44,13 @@ FFA_NEAREST_COST = 25.0
 FFA_NEAREST_RATIO = 0.9
 FFA_POSITION_RAYS = 24
 FFA_STEERING_RAYS = 12
+FFA_PICKUP_FULL_S = 3.0
+FFA_PICKUP_EXPIRY_S = 10.0
+FFA_PICKUP_NEAR_M = 4.0
+FFA_PICKUP_MEMORY_RAYS = 12
+FFA_LASER_TRAVEL_S = 1.5
+FFA_LASER_HOLD_S = 3.0
+FFA_LASER_COVER_RAYS = 24
 
 
 def mech_attacker(event, slot):
@@ -231,6 +240,14 @@ class Selective(eb.Bot):
         self.quiet_speed = max(0, number(obj(obj(hello.get("config")).get("sound")).get("step_speed"), 5) - 0.1)
         self.observers = {}
         self.mode = "survive"
+        self.beam_origins = {}
+        self.laser_shots = {}
+        self.laser_shooter = None
+        self.laser_cover = None
+        self.laser_hold_until = self.laser_dodge_until = -math.inf
+        self.laser_arrived = False
+        self.pickup_retry = {}
+        self.pickup_memory_cursor = 0
 
     def record(self, obs, pos, now):
         """Update bounded observation history without running any policy or map queries."""
@@ -322,7 +339,12 @@ class Selective(eb.Bot):
         if "laser" not in self.kinds and self.pickups:
             eye = raised(pos, self.phys("eye_height", 8, obj(me.get("stats"))))
             sensors = seq(me.get("upgrades")).count("sensors")
-            for ident, (_, _, point) in list(self.pickups.items()):
+            items = list(self.pickups.items())
+            if FFA_PICKUP_TAPER:
+                start = self.pickup_memory_cursor % len(items)
+                items = items[start:] + items[:start]
+            rays = 0
+            for index, (ident, (_, _, point)) in enumerate(items):
                 if ident in self.visible_pickups:
                     continue
                 d = distance(pos, point)
@@ -330,8 +352,32 @@ class Selective(eb.Bot):
                     d <= self.vision + 25 * sensors - 10
                     and abs(angle(bearing(pos, point) - actual[0])) < self.half_fov - 0.10
                 )
-                if expected and (self.arena is None or self.arena.clear_ray(eye, raised(point, 0.5))):
-                    del self.pickups[ident]
+                if expected:
+                    if self.arena is None or self.arena.clear_ray(eye, raised(point, 0.5)):
+                        del self.pickups[ident]
+                    rays += 1
+                    if FFA_PICKUP_TAPER and rays == FFA_PICKUP_MEMORY_RAYS:
+                        self.pickup_memory_cursor += index + 1
+                        break
+
+    def pickup_threats(self, now):
+        threats = []
+        for ident in self.last_seen.keys() | self.attackers.keys() | self.beam_origins.keys():
+            if ident in self.eliminated:
+                continue
+            sight = self.last_seen.get(ident)
+            when, point = (sight.time, sight.pos) if sight else (-math.inf, None)
+            hit, estimate = self.attackers.get(ident, (-math.inf, None))
+            if hit > when:
+                when, point = hit, estimate or point
+            beam, origin = self.beam_origins.get(ident, (-math.inf, None))
+            if beam >= when and origin is not None:
+                when, point = beam, origin
+            age = now - when
+            if point is not None and 0 <= age < FFA_PICKUP_EXPIRY_S:
+                taper = min(1, (FFA_PICKUP_EXPIRY_S - age) / (FFA_PICKUP_EXPIRY_S - FFA_PICKUP_FULL_S))
+                threats.append((point, (self.PICKUP_CLEARANCE * taper) ** 2))
+        return threats
 
     def prepare_risk(self, pos, recent):
         self.position_rays, self.steering_rays = FFA_POSITION_RAYS, FFA_STEERING_RAYS
@@ -451,8 +497,24 @@ class Selective(eb.Bot):
         return True
 
     def safe_pickup_route(self, pos, goal):
+        if FFA_PICKUP_TAPER:
+            return all(segment_distance_sq(pos, goal, enemy) > clearance_sq
+                       for enemy, clearance_sq in self.pickup_clearances)
         return all(segment_distance_sq(pos, goal, enemy) > self.PICKUP_CLEARANCE ** 2
                    for enemy in self.known_enemies.values())
+
+    def nearby_weapon(self, pos):
+        spare = next((i for i, w in enumerate(self.weapon_slots) if not w.get("kind")), None)
+        swap = next((i for i, w in enumerate(self.weapon_slots) if w.get("kind") in ("mortar", "lightning")), None)
+        options = []
+        for ident, (_, kind, point) in self.visible_pickups.items():
+            if kind in self.kinds or (spare is None and (kind != "laser" or swap is None)):
+                continue
+            span = distance_sq(pos, point)
+            if span <= FFA_PICKUP_NEAR_M ** 2 and abs(point[2] - pos[2]) <= FFA_PICKUP_NEAR_M:
+                rank = self.SECONDARIES.index(kind) if kind in self.SECONDARIES else len(self.SECONDARIES)
+                options.append((rank, span, ident))
+        return (min(options)[2], swap if spare is None else None) if options else (None, None)
 
     def weapon_goal(self, pos, zone, weapons, urgent, action):
         if "laser" in self.kinds:
@@ -463,7 +525,11 @@ class Selective(eb.Bot):
             return None
         options = []
         reach = limit(number(self.loot.get("pickup_radius"), 4), 0.5, 15)
+        if FFA_PICKUP_TAPER and not self.safe_pickup_route(pos, pos):
+            return None
         for ident, (_, kind, point) in self.pickups.items():
+            if FFA_PICKUP_TAPER and (ident == self.nearby_take[0] or self.pickup_retry.get(ident, -math.inf) > zone.now):
+                continue
             if kind not in self.SECONDARIES or kind in self.kinds:
                 continue
             priority = self.SECONDARIES.index(kind)
@@ -476,7 +542,9 @@ class Selective(eb.Bot):
             outside = max(0, distance(point, zone.next_center) - zone.next_radius + 10)
             cost = 0 if take else d + max(0, climb - 4) * 2 + outside * 0.55
             option = priority, cost, ident, point, take
-            if zone.gap(point, 0 if take else d / 9 + 4) > 0 and self.safe_pickup_route(pos, point):
+            # A map route can bend around a sighting. Its actual legs are checked in route().
+            start = point if FFA_PICKUP_TAPER and self.arena is not None else pos
+            if zone.gap(point, 0 if take else d / 9 + 4) > 0 and self.safe_pickup_route(start, point):
                 options.append(option)
         if not options:
             return None
@@ -493,9 +561,12 @@ class Selective(eb.Bot):
                 action["drop"] = swap
             return pos[:2]
         self.weapon_point = point
+        self.weapon_id = ident
         return point[:2]
 
     def loot_goal(self, obs, pos, zone, contacts, weapons, hp_fraction, cubes, safe, urgent, action):
+        if FFA_LASER_COVER and self.laser_response_pending:
+            return None
         if self.disengage:
             self.mode = "escape"
             self.goal = self.search = self.route_goal = None
@@ -554,6 +625,8 @@ class Selective(eb.Bot):
         return None
 
     def shelter_point(self, pos, zone, contacts, direction, radius, height, now, until, terminal_burn):
+        if FFA_LASER_COVER and self.laser_response_pending:
+            return pos[:2]
         if self.disengage:
             return pos[:2]
         if terminal_burn:
@@ -562,9 +635,13 @@ class Selective(eb.Bot):
                                          point_score=point_score)
         if self.farm is not None:
             return pos[:2]
+        scouting = (FFA_PICKUP_TAPER and self.opening and self.kinds.isdisjoint(self.SECONDARIES)
+                    and not self.farm_blocked)
         if self.goal is not None and now < self.goal_until and distance(pos, self.goal) > 3:
+            safe_leg = (self.safe_pickup_route(pos, self.goal) if scouting else
+                        self.clear_approach(pos, self.goal, self.OPENING_CLEARANCE, strict=self.opening))
             if (not self.opening or distance(self.goal, zone.next_center) < zone.next_radius) and (
-                    self.clear_approach(pos, self.goal, self.OPENING_CLEARANCE, strict=self.opening)):
+                    safe_leg):
                 return self.goal
 
         arena = self.arena
@@ -574,7 +651,8 @@ class Selective(eb.Bot):
                 or (self.alive == 2 and not self.rivals and self.hp_share > 0.86))
         scout = self.scout_yaw + math.floor(now / 10) * 1.91
         sx, sy = math.cos(scout), math.sin(scout)
-        enemies = self.rivals
+        enemies = (sorted((distance(pos, point), point) for point, _ in self.pickup_clearances)
+                   if scouting else self.rivals)
         options = []
         future_center, future_radius = zone.circle_in(7)
         future_margin = min(5, zone.radius * 0.18)
@@ -639,26 +717,40 @@ class Selective(eb.Bot):
         return best
 
     def route(self, pos, goal, zone, radius, height, stuck, until):
+        if FFA_LASER_COVER and self.laser_response_pending:
+            return goal
         if self.disengage:
             return goal
         arena, pickup = self.arena, self.weapon_point
         if (arena is not None and pickup is not None and pickup[:2] == goal
                 and 3.5 < pickup[2] - pos[2] and distance(pos, pickup) < 30
-                and not arena.solid(raised(pos, height + 1.5))):
+                and not arena.solid(raised(pos, height + 1.5))
+                and (not FFA_PICKUP_TAPER or self.safe_pickup_route(pos, goal))):
             self.climb = True
             return goal
         waypoint_score = self.position_score if self.observers and (FFA_WEDGE or FFA_NOT_NEAREST) else None
         waypoint = super().route(pos, goal, zone, radius, height, stuck, until, waypoint_score=waypoint_score)
         if pickup is not None:
-            points = self.path[self.path_index:] if self.path and self.route_goal == goal else ()
-            if not self.safe_pickup_route(pos, waypoint) or any(
-                    not self.safe_pickup_route(start, end) for start, end in zip(points, points[1:])):
+            follows_path = (self.path and (self.route_goal == goal or
+                            (FFA_PICKUP_TAPER and waypoint == self.path[self.path_index])))
+            points = self.path[self.path_index:] if follows_path else ()
+            unsafe = not self.safe_pickup_route(pos, waypoint) or any(
+                not self.safe_pickup_route(start, end) for start, end in zip(points, points[1:]))
+            if FFA_PICKUP_TAPER and points:
+                unsafe |= not self.safe_pickup_route(points[-1], goal)
+            if unsafe:
                 self.weapon_point = None
                 self.mode = "survive"
-                self.search = self.route_goal = None
-                self.path, self.path_index = (), 0
+                if not FFA_PICKUP_TAPER or self.search is None:
+                    if FFA_PICKUP_TAPER:
+                        self.pickup_retry[self.weapon_id] = zone.now + 0.5
+                    self.search = self.route_goal = None
+                    self.path, self.path_index = (), 0
                 return self.shelter_point(pos, zone, (), None, radius, height, zone.now, until, False)
-        elif waypoint != goal and not self.clear_approach(pos, waypoint, self.OPENING_CLEARANCE if self.opening else 105):
+        elif waypoint != goal and not (
+                self.safe_pickup_route(pos, waypoint) if FFA_PICKUP_TAPER and self.opening
+                and self.kinds.isdisjoint(self.SECONDARIES) and not self.farm_blocked
+                else self.clear_approach(pos, waypoint, self.OPENING_CLEARANCE if self.opening else 105)):
             if zone.gap(pos, 3) <= 8:
                 return waypoint
             self.loot_point = None
@@ -713,12 +805,19 @@ class Selective(eb.Bot):
 
     def movement(self, pos, vel, waypoint, zone, urgent, evade, threats, hazards, direction, stats,
                  grounded, energy, now, until, in_zone, terminal_burn, drop_hint):
-        quiet = self.walk_quietly(pos)
+        if FFA_LASER_COVER and self.laser_response_pending:
+            response = self.laser_move(pos, vel, zone, stats, grounded, energy)
+            if response is not None:
+                self.course, self.sprinting = response["move"], response["boost"]
+                return response
+        quiet = (not FFA_LASER_COVER or not self.laser_response_pending) and self.walk_quietly(pos)
         speed_cap = self.quiet_speed if quiet else None
         steer_score = self.steer_score if self.observers and (FFA_WEDGE or FFA_NOT_NEAREST) else None
         if self.disengage:
             escape = self.escape_move(pos, vel, waypoint, zone, hazards, stats, grounded, energy, urgent, quiet)
             if escape is not None:
+                if FFA_PICKUP_TAPER:
+                    self.sweep_cube(pos, zone, stats, escape)
                 self.course = escape["move"]
                 self.sprinting = escape["boost"]
                 return escape
@@ -736,7 +835,8 @@ class Selective(eb.Bot):
             move = {"move": [speed * math.cos(course), speed * math.sin(course)],
                     "jump": grounded, "boost": not grounded and not quiet}
         if self.weapon_point is not None:
-            projected = pos[0] + 12 * move["move"][0], pos[1] + 12 * move["move"][1]
+            span = min(12, distance(pos, waypoint)) if FFA_PICKUP_TAPER else 12
+            projected = pos[0] + span * move["move"][0], pos[1] + span * move["move"][1]
             if not self.safe_pickup_route(pos, projected):
                 self.weapon_point = None
                 self.mode = "survive"
@@ -749,9 +849,206 @@ class Selective(eb.Bot):
         if (not quiet and (running or self.weapon_point is not None) and grounded and energy > eb.BOOST_RESERVE
                 and distance(pos, waypoint) > 7 and not move.get("jump")):
             move["boost"] = True
+        if FFA_PICKUP_TAPER:
+            self.sweep_cube(pos, zone, stats, move)
         self.course = move["move"]
         self.sprinting = bool(move.get("boost"))
         return move
+
+    def sweep_cube(self, pos, zone, stats, move):
+        # Cubes are automatic. A small correction can bring a passing cube into pickup range.
+        if self.nearby_cube is None or self.climb:
+            return
+        dx, dy = move["move"]
+        pace = math.hypot(dx, dy)
+        if pace < 0.15:
+            return
+        cube = self.nearby_cube
+        x, y = cube[0] - pos[0], cube[1] - pos[1]
+        forward = (x * dx + y * dy) / pace
+        side = (y * dx - x * dy) / pace
+        reach = limit(number(self.cubes.get("pickup_radius"), 3.5), 0.5, FFA_PICKUP_NEAR_M)
+        if forward <= 0 or abs(side) <= reach:
+            return
+        # Turn only far enough to graze the pickup circle, preserving movement speed.
+        turn = math.copysign(math.atan2(abs(side), forward) - math.asin(min(1, (reach - 0.1) / math.hypot(x, y))), side)
+        if abs(turn) > 0.35:
+            return
+        dx, dy = dx * math.cos(turn) - dy * math.sin(turn), dx * math.sin(turn) + dy * math.cos(turn)
+        end = (pos[0] + 5 * dx / pace, pos[1] + 5 * dy / pace)
+        if zone.gap(end, 0.5) < min(0, zone.gap(pos)):
+            return
+        if self.weapon_point is not None and not self.safe_pickup_route(pos, end):
+            return
+        if self.arena is None or self.arena.corridor(pos, end, self.phys("radius", 2.5, stats), self.body_height):
+            move["move"] = [dx, dy]
+
+    def laser_evidence(self, obs, pos, now):
+        radius = limit(self.phys("radius", 2.5, self.self_stats), 0.5, 25)
+        height = limit(self.phys("height", 9, self.self_stats), 1, 80)
+        hits = {}
+        for raw in seq(obs.get("beams"))[:32]:
+            beam = obj(raw)
+            kind, source = beam.get("kind"), number(beam.get("by"), -1)
+            path = seq(beam.get("path"))
+            if (kind not in ("laser", "lightning") or source not in range(16) or source == self.slot
+                    or len(path) < 2 or (origin := vec(path[0], 3)) is None):
+                continue
+            when = now - max(0, number(beam.get("age")))
+            if when >= self.beam_origins.get(source, (-math.inf, None))[0]:
+                self.beam_origins[source] = when, origin
+            if FFA_LASER_COVER and kind == "laser":
+                self.laser_shots[source] = max(when, self.laser_shots.get(source, -math.inf))
+                end = vec(path[1], 3)
+                if (0 <= now - when <= 0.25 and end is not None
+                        and distance_sq(pos, end) <= (radius + 0.75) ** 2
+                        and -0.5 <= end[2] - pos[2] <= height + 0.5):
+                    hits[source] = bearing(pos, origin)
+        if FFA_LASER_COVER:
+            for raw in seq(obs.get("events"))[:200]:
+                event = obj(raw)
+                if event.get("weapon") == "laser" and (source := mech_attacker(event, self.slot)) is not None:
+                    hits.setdefault(source, number(event.get("bearing"), None))
+            self.laser_shots.update((source, now) for source in hits)
+        return hits
+
+    def shooter_origin(self, ident):
+        seen = self.last_seen.get(ident)
+        when, origin = self.beam_origins.get(ident, (-math.inf, None))
+        if seen is not None and seen.time > when:
+            scale = 1 + limit(seen.cubes or 0, 0, 100) * number(self.cubes.get("size_per_cube"), 0.05)
+            return raised(seen.pos, self.phys("muzzle_height", 7) * scale)
+        return origin
+
+    def laser_blocked(self, origin, point):
+        for fraction in (0.92, 0.25, 0.58):
+            if self.laser_rays <= 0:
+                return False
+            self.laser_rays -= 1
+            if self.arena.clear_ray(origin, raised(point, self.body_height * fraction)):
+                return False
+        return True
+
+    def find_laser_cover(self, pos, vel, origin, others, zone, radius, walk, boost, stats, energy):
+        arena = self.arena
+        accel = limit(self.phys("ground_accel", 58.5, stats), 2, 500)
+        drain = limit(self.phys("boost_drain", 17, stats), 0.1, 500)
+        sprint_time = limit((energy - eb.BOOST_RESERVE) / drain, 0, FFA_LASER_TRAVEL_S)
+        travel = sprint_time * boost + (FFA_LASER_TRAVEL_S - sprint_time) * walk
+        pace = boost if sprint_time > 0 else walk
+        start_cell = arena.cell(*pos[:2])
+        elevated = start_cell is not None and pos[2] > arena.floor[start_cell] + arena.step_up + 1.5
+        side = bearing(origin, pos) + math.pi / 2
+        cs, sn = math.cos(side), math.sin(side)
+        options = []
+        for dx, dy in eb.COVER_ANGLES:
+            ux, uy = dx * cs - dy * sn, dx * sn + dy * cs
+            start_speed = vel[0] * ux + vel[1] * uy
+            reach = travel - max(0, pace - start_speed) ** 2 / (2 * accel)
+            for fraction in (0.45, 0.72, 1.0):
+                span = reach * fraction
+                if span < 2:
+                    continue
+                x, y = pos[0] + ux * span, pos[1] + uy * span
+                cell = arena.cell(x, y)
+                if cell is None or (not elevated and not arena.ground_ok(cell, radius)):
+                    continue
+                z = arena.roof[cell] if elevated else arena.floor[cell]
+                point = x, y, z
+                if (elevated and abs(z - pos[2]) > arena.step_up + 0.5
+                        or min(zone.gap(point, FFA_LASER_TRAVEL_S),
+                               zone.gap(point, FFA_LASER_TRAVEL_S + FFA_LASER_HOLD_S)) < 0):
+                    continue
+                options.append((span + 0.35 * min(30, arena.near_cover(point)), point))
+        for _, point in sorted(options):
+            if self.laser_rays < 3:
+                break
+            if (arena.corridor(pos, point, radius, self.body_height)
+                    and self.laser_blocked(origin, point)
+                    and all(self.laser_blocked(other, point) for other in others)):
+                return point
+        return None
+
+    def laser_move(self, pos, vel, zone, stats, grounded, energy):
+        now = zone.now
+        hit = next(iter(self.laser_hits), None)
+        radius = limit(self.phys("radius", 2.5, stats), 0.5, 25)
+        walk = limit(self.phys("walk_speed", 11.7, stats), 2, 60)
+        boost = limit(self.phys("boost_speed", 19.5, stats), walk, 90)
+        sprint = grounded and energy > eb.BOOST_RESERVE
+        pace = boost if sprint else walk
+        arena = self.arena
+        self.laser_rays = FFA_LASER_COVER_RAYS
+        cover = self.laser_cover
+        if cover is not None:
+            others = self.other_shooters(self.laser_shooter, now)
+            exposed = next((ident for ident, origin in others if not self.laser_blocked(origin, cover)), None)
+            arrival = distance(pos, cover) <= 1.15
+            if arrival and not self.laser_arrived:
+                self.laser_arrived = True
+                self.laser_hold_until = max(self.laser_hold_until, now + FFA_LASER_HOLD_S)
+            zone_safe = zone.gap(cover, max(0, self.laser_hold_until - now)) >= 0
+            if now < self.laser_hold_until and exposed is None and zone_safe:
+                return self.move_to_laser_cover(pos, cover, pace, sprint)
+            self.laser_cover = cover = None
+            if hit is None:
+                hit = exposed if exposed is not None else self.laser_shooter if not zone_safe else None
+        if hit is not None:
+            self.laser_shooter = hit
+            self.laser_yaw = self.laser_hits.get(hit)
+            origin = self.shooter_origin(hit)
+            others = tuple(point for _, point in self.other_shooters(hit, now))
+            if arena is not None and origin is not None and grounded:
+                cover = self.find_laser_cover(pos, vel, origin, others, zone, radius, walk, boost, stats, energy)
+            if cover is not None:
+                self.laser_cover, self.laser_arrived = cover, False
+                self.laser_hold_until = now + FFA_LASER_HOLD_S
+                self.laser_dodge_until = -math.inf
+                return self.move_to_laser_cover(pos, cover, pace, sprint)
+            self.laser_dodge_until = now + FFA_LASER_TRAVEL_S
+        if now >= self.laser_dodge_until:
+            self.laser_response_pending = False
+            return None
+
+        origin = self.shooter_origin(self.laser_shooter)
+        yaw = self.laser_yaw
+        if yaw is None:
+            yaw = bearing(pos, origin) if origin is not None else self.actual[0]
+        best = None
+        for offset in (math.pi / 2, -math.pi / 2, 1.1, -1.1, 2.0, -2.0):
+            dx, dy = math.cos(yaw + offset), math.sin(yaw + offset)
+            for horizon in (0.55, 0.25):
+                end = pos[0] + dx * pace * horizon, pos[1] + dy * pace * horizon
+                gap = zone.gap(end, horizon)
+                if gap < min(0, zone.gap(pos, horizon)) or (
+                        arena is not None and not arena.corridor(pos, end, radius, self.body_height)):
+                    continue
+                score = (abs(offset) == math.pi / 2, horizon, gap, dx * vel[0] + dy * vel[1])
+                if best is None or score > best[0]:
+                    best = score, [dx, dy]
+                break
+        if best is not None:
+            self.mode = "laser-dodge"
+            return {"move": best[1], "boost": sprint, "jump": False}
+        return None
+
+    def other_shooters(self, primary, now):
+        shots = {ident: when for ident, (when, _) in self.attackers.items()}
+        for ident, when in self.laser_shots.items():
+            shots[ident] = max(shots.get(ident, -math.inf), when)
+        for ident, when in sorted(shots.items(), key=lambda item: item[1], reverse=True):
+            if ident == primary or ident in self.eliminated or not 0 <= now - when <= FFA_LASER_HOLD_S:
+                continue
+            origin = self.shooter_origin(ident)
+            if origin is not None:
+                yield ident, origin
+
+    def move_to_laser_cover(self, pos, cover, pace, sprint):
+        self.mode = "laser-cover"
+        span = distance(pos, cover)
+        scale = min(1, span / (pace * 0.28)) if span > 0.45 else 0
+        yaw = bearing(pos, cover)
+        return {"move": [scale * math.cos(yaw), scale * math.sin(yaw)], "boost": sprint and scale > 0, "jump": False}
 
     def no_escape(self, pos, enemy, zone):
         radius = self.phys("radius", 2.5, self.self_stats)
@@ -913,6 +1210,8 @@ class Selective(eb.Bot):
         self.climb = self.sprinting = False
         self.course = (0.0, 0.0)
         self.escape_bearings = []
+        self.laser_response_pending = False
+        self.nearby_take = (None, None)
         me = obj(obs.get("self"))
         now, pos = number(obs.get("t"), 0), vec(me.get("pos"), 3)
         self.actual = vec(me.get("aim"), 2) or (0, 0)
@@ -932,6 +1231,20 @@ class Selective(eb.Bot):
             self.energy = limit(number(me.get("energy")), 0, 1000)
             self.record(obs, pos, now)
             if pos is not None:
+                if FFA_PICKUP_TAPER or FFA_LASER_COVER:
+                    self.laser_hits = self.laser_evidence(obs, pos, now)
+                    self.laser_response_pending = bool(FFA_LASER_COVER and (
+                        self.laser_hits or self.laser_cover is not None or now < self.laser_dodge_until))
+                if FFA_PICKUP_TAPER:
+                    self.pickup_clearances = self.pickup_threats(now)
+                    self.pickup_retry = {ident: retry for ident, retry in self.pickup_retry.items() if retry > now}
+                    self.nearby_take = self.nearby_weapon(pos)
+                    self.nearby_cube = min(
+                        (point for raw in seq(obs.get("cubes"))[:64]
+                         if (point := vec(obj(raw).get("pos"), 3)) is not None
+                         and abs(point[2] - pos[2]) <= FFA_PICKUP_NEAR_M
+                         and distance_sq(pos, point) <= FFA_PICKUP_NEAR_M ** 2),
+                        key=lambda point: distance_sq(pos, point), default=None)
                 self.observe(me, pos, self.actual, now)
                 # Seed the inherited contact ranking with hits seen before the switch.
                 self.hits.update({ident: when for ident, (when, _) in self.attackers.items()
@@ -939,13 +1252,21 @@ class Selective(eb.Bot):
             self.last_fire_target = None
             action = super().act(obs)
             if pos is not None:
-                if self.disengage and self.last_fire_target is None:
+                if self.disengage and self.last_fire_target is None and not self.laser_response_pending:
                     action["aim"] = [self.escape_facing(), 0.0]
                 elif self.last_fire_target is None and self.weapon_point is not None and not self.exposed:
                     action["aim"] = [bearing(pos, self.weapon_point), 0.0]
-                elif self.last_fire_target is None and not self.rivals and now - self.last_damage >= eb.HIT_MEMORY_S:
-                    action["aim"] = [angle(self.scout_yaw + now * 1.9), 0.0]
+                elif self.last_fire_target is None and now - self.last_damage >= eb.HIT_MEMORY_S:
+                    if (FFA_PICKUP_TAPER and self.opening and self.kinds.isdisjoint(self.SECONDARIES)
+                            and not self.farm_blocked and math.hypot(*self.course) > 0.2):
+                        action["aim"] = [math.atan2(self.course[1], self.course[0]), 0.0]
+                    elif not self.rivals:
+                        action["aim"] = [angle(self.scout_yaw + now * 1.9), 0.0]
                 action.setdefault("fire", [False, False])
+                if self.mode in ("laser-cover", "laser-dodge") and math.hypot(*self.course) > 0:
+                    for index, weapon in enumerate(self.weapon_slots):
+                        if weapon.get("kind") == "laser":
+                            action["fire"][index] = False
                 self.release_laser_safely(obs, action, pos)
         except errors:
             try:
@@ -955,6 +1276,13 @@ class Selective(eb.Bot):
                     action.pop(key, None)
             except errors:
                 action = {}
+        if FFA_PICKUP_TAPER and self.nearby_take[0] is not None:
+            ident, swap = self.nearby_take
+            action["take"] = ident
+            if swap is None:
+                action.pop("drop", None)
+            else:
+                action["drop"] = swap
         if offer:
             index = min(len(seq(me.get("upgrades"))), len(self.UPGRADES) - 1)
             rank = self.UPGRADES[index]
