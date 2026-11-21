@@ -25,9 +25,9 @@ SECOND_RANK = {"lightning": 3, "laser": 2, "mortar": 1}
 VEL_SMOOTH = 0.35          # weight of the newest velocity sample in the per-target average
 RETREAT_FRACTION = 0.30    # break contact below this health share when the duel is going badly
 NPC_FARM_M = 120.0
-GUN_RANGE_M = 38.0
+GUN_RANGE_M = 90.0          # preferred gun-only duel range (simulator: dodging needs flight time)
 STRAFE_MIN_S = 0.3
-STRAFE_MAX_S = 0.7          # preferred duel range with the gun alone
+STRAFE_MAX_S = 0.7
 CRATE_FARM_M = 70.0
 
 
