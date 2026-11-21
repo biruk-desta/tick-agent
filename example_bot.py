@@ -620,7 +620,8 @@ class Bot:
                     break
         return hazards
 
-    def shelter_point(self, pos, zone, contacts, direction, radius, height, now, until, terminal_burn):
+    def shelter_point(self, pos, zone, contacts, direction, radius, height, now, until, terminal_burn,
+                      *, point_score=None):
         arena = self.arena
         if arena is None:
             return None
@@ -662,6 +663,8 @@ class Bot:
                         score -= 19
                 if not danger and source:
                     score += 13 if not arena.clear_ray(source, endpoint) else -5
+                if point_score is not None:
+                    score += 0.20 * point_score((p[0], p[1], base))
                 if score > best_score:
                     best, best_score = p, score
         self.shelter = best if best_score > -14 else None
@@ -747,7 +750,7 @@ class Bot:
                 return p[:2]
         return None
 
-    def route(self, pos, goal, zone, radius, height, stuck, until):
+    def route(self, pos, goal, zone, radius, height, stuck, until, *, waypoint_score=None):
         arena = self.arena
         if arena is None or distance(pos, goal) < 0.5:
             return goal
@@ -783,17 +786,29 @@ class Bot:
         if self.path:
             while self.path_index + 1 < len(self.path) and distance(pos, self.path[self.path_index]) < 2.7:
                 self.path_index += 1
+            best = None
             for i in range(min(self.path_index + ROUTE_LOOKAHEAD_CELLS, len(self.path) - 1), self.path_index - 1, -1):
-                if arena.corridor(pos, self.path[i], radius, height):
+                point = self.path[i]
+                if not arena.corridor(pos, point, radius, height):
+                    continue
+                if waypoint_score is None:
                     self.path_index = i
-                    return self.path[i]
+                    return point
+                base = arena.floor[arena.cell(*point)]
+                option = (i * GRID_M + 0.20 * waypoint_score((*point, base)), i)
+                if best is None or option > best:
+                    best = option
+            if best is not None:
+                self.path_index = best[1]
+                return self.path[self.path_index]
             if stuck:
                 self.route_goal = None
             return self.path[self.path_index]
         return goal
 
     def movement(self, pos, vel, waypoint, zone, urgent, evade, threats, hazards, direction, stats,
-                 grounded, energy, now, until, in_zone, terminal_burn, drop_hint):
+                 grounded, energy, now, until, in_zone, terminal_burn, drop_hint, *, steer_score=None,
+                 speed_cap=None):
         arena = self.arena
         walk = limit(self.phys("walk_speed", 11.7, stats), 2, 60)
         boost = limit(self.phys("boost_speed", 19.5, stats), walk, 90)
@@ -807,7 +822,7 @@ class Bot:
         stuck = now < self.stuck_until
         core = zone.radius <= DEATH_CIRCLE_M and not terminal_burn
         clearance = zone.gap(pos)
-        sprint = energy > (JET_RESERVE if clearance < 0 else BOOST_RESERVE) and (
+        sprint = speed_cap is None and energy > (JET_RESERVE if clearance < 0 else BOOST_RESERVE) and (
             (urgent and goal_distance > 12 and (clearance < 8 or zone.gap(pos, 4) < 3))
             or (evade and not core and (hazards or any(c.clear and c.dist < BOOST_THREAT_M for c in threats))))
         pace = boost if sprint and grounded else walk
@@ -826,6 +841,8 @@ class Bot:
             else:
                 goal_scale = limit(goal_distance / CORE_SLOW_M, 0.03, 0.8)
         scale = 1.0 if (evade or hazards) and not core else goal_scale
+        if speed_cap is not None:
+            scale = min(scale, speed_cap / walk)
         horizon = CORE_HORIZON_S if core else STEER_HORIZON_S
         best_score, move = -math.inf, (dx * scale, dy * scale)
         clear_forward = True
@@ -884,6 +901,8 @@ class Bot:
                 score -= max(0, reach - distance(future, impact)) * (2.1 if not core else 1.0)
             if direction is not None and not threats and evade:
                 score -= (mx * math.cos(direction) + my * math.sin(direction)) * 1.5
+            if steer_score is not None and not wall:
+                score += (0.06 if urgent else 0.16) * steer_score(endpoint)
             if score > best_score:
                 best_score, move = score, (mx, my)
         jet = False
@@ -893,13 +912,14 @@ class Bot:
             cell = arena.cell(*waypoint)
             terminal_roof = (distance(waypoint, zone.next_center) < 2 and cell is not None
                              and arena.roof[cell] > pos[2] + arena.step_up)
-        if arena is not None and not clear_forward and urgent and (stuck or core or terminal_roof) and energy > JET_RESERVE:
+        if (speed_cap is None and arena is not None and not clear_forward and urgent
+                and (stuck or core or terminal_roof) and energy > JET_RESERVE):
             overhead = arena.solid(raised(pos, height + 1.0))
             if not overhead:
                 # A short approach when facing a wall buys altitude while preserving jet fuel.
                 move = dx * 0.52, dy * 0.52
                 jump, jet = grounded, not grounded
-        if not grounded:
+        if speed_cap is None and not grounded:
             cell = arena.cell(*pos[:2]) if arena is not None else None
             if cell is not None and vel[2] < -3 and pos[2] - arena.roof[cell] > 4 and urgent and energy > 30:
                 jet = True

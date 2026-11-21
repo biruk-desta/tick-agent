@@ -27,6 +27,20 @@ USE_PAUSE = False
 USE_E = True
 USE_R = True
 USE_H2 = True
+FFA_WEDGE = True
+FFA_NOT_NEAREST = True
+FFA_UNSEEN_OPEN = True
+FFA_QUIET_WALK = True
+
+FFA_SIGHT_MEMORY_S = 3.0
+FFA_WEDGE_MARGIN = math.radians(10)
+FFA_WEDGE_COST = 40.0
+FFA_LASER_MULT = 1.5
+FFA_HIDDEN_REWARD = 12.0
+FFA_NEAREST_COST = 25.0
+FFA_NEAREST_RATIO = 0.9
+FFA_POSITION_RAYS = 24
+FFA_STEERING_RAYS = 12
 
 
 def mech_attacker(event, slot):
@@ -43,6 +57,11 @@ def segment_distance_sq(pos, end, point):
     span = dx * dx + dy * dy
     along = limit((px * dx + py * dy) / span, 0, 1) if span else 0
     return (px - along * dx) ** 2 + (py - along * dy) ** 2
+
+
+def distance_sq(a, b):
+    dx, dy = a[0] - b[0], a[1] - b[1]
+    return dx * dx + dy * dy
 
 
 class Detector:
@@ -161,6 +180,14 @@ class Sighting(NamedTuple):
     weapons: tuple
     cubes: float | None
     hp: float | None
+    yaw: float | None
+
+
+class Observer(NamedTuple):
+    pos: tuple
+    eye: tuple
+    facing: tuple | None
+    wedge_weight: float
 
 
 class Selective(eb.Bot):
@@ -198,6 +225,10 @@ class Selective(eb.Bot):
         self.vision = limit(number(vision.get("range"), 200), 45, 350)
         self.near_vision = limit(number(vision.get("near_range"), 45), 5, 100)
         self.half_fov = math.radians(limit(number(vision.get("fov_deg"), 120), 10, 360) / 2)
+        self.fov_cos = math.cos(self.half_fov)
+        self.margin_cos = math.cos(min(math.pi, self.half_fov + FFA_WEDGE_MARGIN))
+        self.quiet_speed = max(0, number(obj(obj(hello.get("config")).get("sound")).get("step_speed"), 5) - 0.1)
+        self.observers = {}
         self.mode = "survive"
 
     def record(self, obs, pos, now):
@@ -228,8 +259,10 @@ class Selective(eb.Bot):
             ident, point = number(enemy.get("id"), None), vec(enemy.get("pos"), 3)
             if (enemy.get("kind") == "mech" and ident is not None and 0 <= ident < 16 and ident == int(ident) and ident != self.slot
                     and ident not in self.eliminated and point is not None):
+                aim = seq(enemy.get("aim"))
                 self.last_seen[ident] = Sighting(now, point, tuple(seq(enemy.get("weapons"))[:2]),
-                                                number(enemy.get("cubes"), None), number(enemy.get("hp"), None))
+                                                number(enemy.get("cubes"), None), number(enemy.get("hp"), None),
+                                                number(aim[0], None) if aim else None)
         visible = {}
         for raw in seq(obs.get("pickups"))[:64]:
             item = obj(raw)
@@ -270,7 +303,8 @@ class Selective(eb.Bot):
         self.disengage = len(self.escape_attackers) >= 2
 
         self.near_sound = 0 <= now - self.last_near_sound <= 2
-        recent = {i for i, entry in self.last_seen.items() if 0 <= now - entry.time < 3}
+        recent = {i for i, entry in self.last_seen.items() if 0 <= now - entry.time < FFA_SIGHT_MEMORY_S}
+        self.prepare_risk(pos, recent)
         if self.alive == 2 and recent:
             most_recent = max(self.last_seen[i].time for i in recent)
             recent = {i for i in recent if self.last_seen[i].time == most_recent}
@@ -298,6 +332,114 @@ class Selective(eb.Bot):
                 if expected and (self.arena is None or self.arena.clear_ray(eye, raised(point, 0.5))):
                     del self.pickups[ident]
 
+    def prepare_risk(self, pos, recent):
+        self.position_rays, self.steering_rays = FFA_POSITION_RAYS, FFA_STEERING_RAYS
+        self.self_los = {}
+        self.body_height = limit(self.phys("height", 9, self.self_stats), 1, 80)
+        self.observers = {}
+        self.nearest_thresholds = ()
+        if not (FFA_WEDGE or FFA_NOT_NEAREST or FFA_UNSEEN_OPEN or FFA_QUIET_WALK):
+            return
+        eye = limit(self.phys("eye_height", 8), 1, 80)
+        size_per_cube = number(self.cubes.get("size_per_cube"), 0.05)
+        for ident in sorted(recent, key=lambda i: distance_sq(pos, self.last_seen[i].pos)):
+            seen = self.last_seen[ident]
+            scale = 1 + size_per_cube * limit(seen.cubes or 0, 0, number(self.cubes.get("stat_cap"), 10))
+            facing = (math.cos(seen.yaw), math.sin(seen.yaw)) if seen.yaw is not None else None
+            weight = FFA_WEDGE_COST * (FFA_LASER_MULT if "laser" in seen.weapons else 1)
+            self.observers[ident] = Observer(seen.pos, raised(seen.pos, eye * scale), facing, weight)
+        if FFA_NOT_NEAREST:
+            # Only destinations beyond this radius give the observer a closer rival.
+            points = [enemy.pos for enemy in self.observers.values()]
+            self.nearest_thresholds = tuple(
+                (point, min((distance_sq(point, other) for j, other in enumerate(points) if i != j),
+                            default=math.inf) / FFA_NEAREST_RATIO ** 2)
+                for i, point in enumerate(points)
+            )
+
+    def in_wedge(self, enemy, point, span_sq, margin=False):
+        if span_sq <= self.near_vision ** 2:
+            return True
+        if span_sq > self.vision ** 2:
+            return False
+        if enemy.facing is None:
+            return True
+        dx, dy = point[0] - enemy.pos[0], point[1] - enemy.pos[1]
+        return dx * enemy.facing[0] + dy * enemy.facing[1] >= (
+            self.margin_cos if margin else self.fov_cos) * math.sqrt(span_sq)
+
+    def nearest_cost(self, point):
+        cost = 0.0
+        for enemy, threshold in self.nearest_thresholds:
+            span_sq = distance_sq(point, enemy)
+            if span_sq <= threshold:
+                cost += FFA_NEAREST_COST * 150 ** 2 / max(45 ** 2, span_sq)
+        return cost
+
+    def wedge_threats(self, point):
+        for enemy in self.observers.values():
+            span_sq = distance_sq(point, enemy.pos)
+            if self.in_wedge(enemy, point, span_sq, margin=True):
+                weight = enemy.wedge_weight * min(2, 150 / max(45, math.sqrt(span_sq)))
+                yield enemy.eye, weight
+
+    def wedge_score(self, point, threats, steering=False):
+        ray_budget = self.steering_rays if steering else self.position_rays
+        chest = raised(point, self.body_height * 0.65)
+        cost = 0.0
+        for eye, weight in threats:
+            if self.arena is not None and ray_budget > 0:
+                ray_budget -= 1
+                if not self.arena.clear_ray(eye, chest):
+                    continue
+            # A candidate with untested rays cannot claim cover.
+            cost += weight
+        if steering:
+            self.steering_rays = ray_budget
+        else:
+            self.position_rays = ray_budget
+        return -cost if cost else FFA_HIDDEN_REWARD
+
+    def position_score(self, point):
+        wedge = self.wedge_score(point, self.wedge_threats(point)) if FFA_WEDGE and self.observers else 0
+        return wedge - self.nearest_cost(point)
+
+    def steer_score(self, point):
+        wedge = self.wedge_score(point, self.wedge_threats(point), steering=True) if FFA_WEDGE and self.observers else 0
+        return wedge - self.nearest_cost(point)
+
+    def line_to_self(self, ident, enemy, pos):
+        # Two rays per known opponent at most, even if the route changes during steering.
+        if ident not in self.self_los:
+            self.self_los[ident] = (self.arena is None
+                                    or self.arena.clear_ray(enemy.eye, raised(pos, self.body_height * 0.5))
+                                    or self.arena.clear_ray(enemy.eye, raised(pos, self.body_height)))
+        return self.self_los[ident]
+
+    def can_open(self, ident, pos):
+        if not FFA_UNSEEN_OPEN:
+            return True
+        target = self.observers.get(ident)
+        if target is None or target.facing is None or self.in_wedge(target, pos, distance_sq(pos, target.pos)):
+            return False
+        return not any(
+            other != ident and (span_sq := distance_sq(pos, enemy.pos)) <= 160 ** 2
+            and self.in_wedge(enemy, pos, span_sq)
+            for other, enemy in self.observers.items()
+        )
+
+    def walk_quietly(self, pos):
+        if not FFA_QUIET_WALK:
+            return False
+        if any(distance_sq(pos, enemy.pos) <= 120 ** 2 for enemy in self.observers.values()):
+            return False
+        pickup = self.weapon_point or self.loot_point
+        if pickup is not None:
+            race_limit = 1.5 ** 2 * distance_sq(pos, pickup)
+            if any(distance_sq(enemy.pos, pickup) < race_limit for enemy in self.observers.values()):
+                return False
+        return not any(self.line_to_self(ident, enemy, pos) for ident, enemy in self.observers.items())
+
     def clear_approach(self, pos, goal, clearance, strict=False):
         for d, enemy in self.rivals:
             minimum = clearance if strict else min(clearance, max(0, d - 1))
@@ -318,7 +460,7 @@ class Selective(eb.Bot):
         swap = next((i for i, w in enumerate(weapons) if w.get("kind") in self.SECONDARIES), None)
         if urgent or (spare is None and swap is None):
             return None
-        best = None
+        options = []
         reach = limit(number(self.loot.get("pickup_radius"), 4), 0.5, 15)
         for ident, (_, kind, point) in self.pickups.items():
             if kind not in self.SECONDARIES or kind in self.kinds:
@@ -333,11 +475,15 @@ class Selective(eb.Bot):
             outside = max(0, distance(point, zone.next_center) - zone.next_radius + 10)
             cost = 0 if take else d + max(0, climb - 4) * 2 + outside * 0.55
             option = priority, cost, ident, point, take
-            if (best is None or option < best) and zone.gap(point, 0 if take else d / 9 + 4) > 0:
-                if self.safe_pickup_route(pos, point):
-                    best = option
-        if best is None:
+            if zone.gap(point, 0 if take else d / 9 + 4) > 0 and self.safe_pickup_route(pos, point):
+                options.append(option)
+        if not options:
             return None
+        options.sort()
+        best = options[0]
+        if self.observers and (FFA_WEDGE or FFA_NOT_NEAREST) and not best[4]:
+            best = min((option for option in options[:6] if option[0] == best[0]),
+                       key=lambda option: option[1] - self.position_score(option[3]))
         _, _, ident, point, take = best
         self.mode = "arm"
         if take:
@@ -369,7 +515,7 @@ class Selective(eb.Bot):
                 if (d < 135 and zone.gap(point, d / 9 + 3) > 2
                         and (not self.opening or distance(point, zone.next_center) < zone.next_radius)
                         and self.clear_approach(pos, point, self.SEPARATION, strict=self.opening)):
-                    options.append((d, point[:2]))
+                    options.append((d, point))
         for raw in seq(obs.get("drops"))[:8]:
             item = obj(raw)
             point = vec(item.get("pos"), 3)
@@ -380,10 +526,15 @@ class Selective(eb.Bot):
                     and zone.gap(point, d / 9 + 10) > 4
                     and (not self.opening or distance(point, zone.next_center) < zone.next_radius)
                     and self.clear_approach(pos, point, 165, strict=self.opening)):
-                options.append((d * 0.60 - 14 - 24 * (1 - hp_fraction), point[:2]))
+                options.append((d * 0.60 - 14 - 24 * (1 - hp_fraction), point))
         if options:
             self.mode = "loot"
-            return min(options)[1]
+            options.sort()
+            if self.observers and (FFA_WEDGE or FFA_NOT_NEAREST):
+                self.loot_point = min(options[:6], key=lambda option: option[0] - self.position_score(option[1]))[1]
+            else:
+                self.loot_point = options[0][1]
+            return self.loot_point[:2]
         if (self.alive <= 3 or zone.next_radius < 40 or hp_fraction < 0.8 or nearest < 175
                 or (cubes >= 21 and not self.kinds.isdisjoint(self.SECONDARIES))):
             return None
@@ -405,7 +556,9 @@ class Selective(eb.Bot):
         if self.disengage:
             return pos[:2]
         if terminal_burn:
-            return super().shelter_point(pos, zone, contacts, direction, radius, height, now, until, True)
+            point_score = self.position_score if self.observers and (FFA_WEDGE or FFA_NOT_NEAREST) else None
+            return super().shelter_point(pos, zone, contacts, direction, radius, height, now, until, True,
+                                         point_score=point_score)
         if self.farm is not None:
             return pos[:2]
         if self.goal is not None and now < self.goal_until and distance(pos, self.goal) > 3:
@@ -451,14 +604,32 @@ class Selective(eb.Bot):
                     if self.alive == 2 and self.fight is not None:
                         preferred = 152 if "laser" in self.kinds else 125
                         score -= abs(separation - preferred) * 1.2
+                score -= self.nearest_cost(point)
                 options.append((score, run, point, base))
         best, top_score = pos[:2], -math.inf
-        standing = [option for option in options if option[1] == 0]
-        for score, run, point, base in sorted(options, reverse=True)[:5] + standing:
+        wedge = FFA_WEDGE and self.observers
+        if wedge:
+            candidates = []
+            for score, run, point, base in options:
+                threats = tuple(self.wedge_threats(point))
+                exposed_score = score - sum(weight for _, weight in threats) if threats else score + FFA_HIDDEN_REWARD
+                candidates.append((exposed_score, score, run, point, base, threats))
+            # Give the best candidates under open sightlines first use of the ray budget.
+            candidates.sort(reverse=True, key=lambda option: option[:4])
+        else:
+            standing = [option for option in options if option[1] == 0]
+            candidates = [(score, score, run, point, base, ()) for score, run, point, base
+                          in sorted(options, reverse=True)[:5] + standing]
+        for _, score, run, point, base, threats in candidates:
+            if wedge:
+                if score + FFA_HIDDEN_REWARD <= top_score:
+                    continue
+                score += self.wedge_score((*point, base), threats)
             if arena is not None and time.perf_counter() < until:
-                for _, enemy in enemies[:2]:
-                    if not arena.clear_ray(raised(enemy, 8), (point[0], point[1], base + height * 0.65)):
-                        score += 28
+                if not wedge:
+                    for _, enemy in enemies[:2]:
+                        if not arena.clear_ray(raised(enemy, 8), (point[0], point[1], base + height * 0.65)):
+                            score += 28
                 if run and not arena.corridor(pos, point, radius, height):
                     score -= 9
             if score > top_score:
@@ -475,7 +646,8 @@ class Selective(eb.Bot):
                 and not arena.solid(raised(pos, height + 1.5))):
             self.climb = True
             return goal
-        waypoint = super().route(pos, goal, zone, radius, height, stuck, until)
+        waypoint_score = self.position_score if self.observers and (FFA_WEDGE or FFA_NOT_NEAREST) else None
+        waypoint = super().route(pos, goal, zone, radius, height, stuck, until, waypoint_score=waypoint_score)
         if pickup is not None:
             points = self.path[self.path_index:] if self.path and self.route_goal == goal else ()
             if not self.safe_pickup_route(pos, waypoint) or any(
@@ -488,17 +660,22 @@ class Selective(eb.Bot):
         elif waypoint != goal and not self.clear_approach(pos, waypoint, self.OPENING_CLEARANCE if self.opening else 105):
             if zone.gap(pos, 3) <= 8:
                 return waypoint
+            self.loot_point = None
             return self.shelter_point(pos, zone, (), None, radius, height, zone.now, until, False)
         return waypoint
 
-    def escape_move(self, pos, vel, goal, zone, hazards, stats, grounded, energy, urgent):
+    def escape_move(self, pos, vel, goal, zone, hazards, stats, grounded, energy, urgent, quiet):
         arena = self.arena
         radius = limit(self.phys("radius", 2.5, stats), 0.5, 25)
         height = limit(self.phys("height", 9, stats), 1, 80)
-        boost = grounded and energy > eb.BOOST_RESERVE
-        pace = limit(self.phys("boost_speed" if boost else "walk_speed", 19.5 if boost else 11.7, stats), 2, 90)
+        boost = not quiet and grounded and energy > eb.BOOST_RESERVE
+        walk = limit(self.phys("walk_speed", 11.7, stats), 2, 90)
+        pace = limit(self.phys("boost_speed", 19.5, stats), 2, 90) if boost else walk
+        scale = min(1, self.quiet_speed / walk) if quiet else 1
+        pace *= scale
         attackers = [(distance(pos, point), point) for point in self.escape_attackers.values() if point is not None]
         self.escape_bearings = [(span, bearing(pos, point)) for span, point in attackers]
+        cover_threats = sorted(attackers)[:2] if FFA_WEDGE else attackers
         best, move = None, (0.0, 0.0)
         center, size = zone.circle_in(1.5)
         gap = size - distance(pos, center)
@@ -521,20 +698,25 @@ class Selective(eb.Bot):
             for impact, seconds, reach in hazards:
                 future = pos[0] + dx * pace * seconds, pos[1] + dy * pace * seconds
                 score -= 2.1 * max(0, reach - distance(future, impact))
-            if arena is not None:
+            if FFA_WEDGE or FFA_NOT_NEAREST:
+                score += 0.16 * self.steer_score((*end, pos[2]))
+            if arena is not None and not (FFA_WEDGE and self.observers):
                 body = end[0], end[1], pos[2] + height * 0.65
-                score += 28 * sum(not arena.clear_ray(raised(point, 8), body) for _, point in attackers)
+                score += 28 * sum(not arena.clear_ray(raised(point, 8), body) for _, point in cover_threats)
             option = (worst > 0, score)
             if best is None or option > best:
-                best, move = option, (dx, dy)
+                best, move = option, (dx * scale, dy * scale)
         if best is None:
             return None
         return {"move": list(move), "boost": boost, "jump": False}
 
     def movement(self, pos, vel, waypoint, zone, urgent, evade, threats, hazards, direction, stats,
                  grounded, energy, now, until, in_zone, terminal_burn, drop_hint):
+        quiet = self.walk_quietly(pos)
+        speed_cap = self.quiet_speed if quiet else None
+        steer_score = self.steer_score if self.observers and (FFA_WEDGE or FFA_NOT_NEAREST) else None
         if self.disengage:
-            escape = self.escape_move(pos, vel, waypoint, zone, hazards, stats, grounded, energy, urgent)
+            escape = self.escape_move(pos, vel, waypoint, zone, hazards, stats, grounded, energy, urgent, quiet)
             if escape is not None:
                 self.course = escape["move"]
                 self.sprinting = escape["boost"]
@@ -543,12 +725,15 @@ class Selective(eb.Bot):
         running = (nearest < 118 and self.fight is None and self.weapon_point is None
                    and (distance(pos, waypoint) > eb.HOLD_M or any(c.clear for c in threats)))
         move = super().movement(pos, vel, waypoint, zone, urgent, evade or running, threats, hazards, direction,
-                                stats, grounded, energy, now, until, in_zone, terminal_burn, drop_hint)
+                                stats, grounded, energy, now, until, in_zone, terminal_burn, drop_hint,
+                                steer_score=steer_score, speed_cap=speed_cap)
         if self.climb:
             course = bearing(pos, waypoint)
             speed = 0.33 if self.weapon_point[2] - pos[2] > 7 else 0.75
+            if quiet:
+                speed = min(speed, self.quiet_speed / limit(self.phys("walk_speed", 11.7, stats), 2, 60))
             move = {"move": [speed * math.cos(course), speed * math.sin(course)],
-                    "jump": grounded, "boost": not grounded}
+                    "jump": grounded, "boost": not grounded and not quiet}
         if self.weapon_point is not None:
             projected = pos[0] + 12 * move["move"][0], pos[1] + 12 * move["move"][1]
             if not self.safe_pickup_route(pos, projected):
@@ -556,9 +741,11 @@ class Selective(eb.Bot):
                 self.mode = "survive"
                 cover = self.shelter_point(pos, zone, (), direction, self.phys("radius", 2.5, stats),
                                            self.phys("height", 9, stats), now, until, terminal_burn)
+                quiet = self.walk_quietly(pos)
                 move = super().movement(pos, vel, cover, zone, urgent, evade, threats, hazards, direction,
-                                        stats, grounded, energy, now, until, in_zone, terminal_burn, drop_hint)
-        if ((running or self.weapon_point is not None) and grounded and energy > eb.BOOST_RESERVE
+                                        stats, grounded, energy, now, until, in_zone, terminal_burn, drop_hint,
+                                        steer_score=steer_score, speed_cap=self.quiet_speed if quiet else None)
+        if (not quiet and (running or self.weapon_point is not None) and grounded and energy > eb.BOOST_RESERVE
                 and distance(pos, waypoint) > 7 and not move.get("jump")):
             move["boost"] = True
         self.course = move["move"]
@@ -630,10 +817,14 @@ class Selective(eb.Bot):
                         or segment_distance_sq(pos, end, enemy.pos) > (enemy.scale * 2.5 + 4) ** 2):
                     continue
             when, _ = self.attackers.get(enemy.id, (-math.inf, None))
-            if 0 <= now - when <= 6 or enemy is self.fight:
+            if 0 <= now - when <= 6:
                 options.append((100 - enemy.dist * 0.1, enemy))
                 continue
-            if enemy.dist <= 30:
+            if enemy is self.fight:
+                if self.can_open(enemy.id, pos):
+                    options.append((100 - enemy.dist * 0.1, enemy))
+                continue
+            if enemy.dist <= 30 and self.can_open(enemy.id, pos):
                 dx, dy = pos[0] - enemy.pos[0], pos[1] - enemy.pos[1]
                 if dx * enemy.vel[0] + dy * enemy.vel[1] > 0 and self.no_escape(pos, enemy, zone):
                     options.append((100 - enemy.dist * 0.1, enemy))
@@ -641,7 +832,7 @@ class Selective(eb.Bot):
             if (math.isfinite(enemy.hp) and not self.near_sound
                     and all(i == enemy.id or distance(pos, point) > 150 and distance(enemy.pos, point) > 150
                             for i, point in self.known_enemies.items())
-                    and enemy.hp < self.finish_damage(enemy, pos)):
+                    and self.can_open(enemy.id, pos) and enemy.hp < self.finish_damage(enemy, pos)):
                 options.append((115 - enemy.dist * 0.1, enemy))
         if options:
             return sorted(options, key=lambda option: option[0], reverse=True)
@@ -717,7 +908,7 @@ class Selective(eb.Bot):
     def act(self, obs):
         errors = (ArithmeticError, LookupError, TypeError, ValueError, AttributeError)
         self.mode = "survive"
-        self.weapon_point = self.fight = self.farm = None
+        self.weapon_point = self.loot_point = self.fight = self.farm = None
         self.climb = self.sprinting = False
         self.course = (0.0, 0.0)
         self.escape_bearings = []
