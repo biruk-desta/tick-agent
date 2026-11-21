@@ -38,6 +38,7 @@ REPAIR_TO = 0.85                # heal to this share before hunting the next one
 VEL_SMOOTH = 0.35          # weight of the newest velocity sample in the per-target average
 RETREAT_FRACTION = 0.30    # break contact below this health share when the duel is going badly
 NPC_FARM_M = 120.0
+FIGHT_CUBE_M = 40.0
 GUN_RANGE_M = 90.0          # preferred gun-only duel range (simulator: dodging needs flight time)
 STRAFE_MIN_S = 0.3
 STRAFE_MAX_S = 0.7
@@ -278,6 +279,13 @@ class DuelBot(Bot):
         if not urgent and foe is not None and not retreating and not terminal_burn:
             self.mode = "duel"
             move, boost = self.engage_move(pos, foe, kinds, zone, now, radius, height, energy, fraction, hunters)
+            cube = self.cube_goal(obs, pos, zone, FIGHT_CUBE_M) if fraction > RETREAT_FRACTION else None
+            if cube is not None:
+                # Kill cubes heal and add damage: walk onto them mid-fight, still aiming at the foe.
+                self.mode = "duel-cube"
+                c = bearing(pos, cube)
+                move = [math.cos(c), math.sin(c)]
+                boost = energy > 30
             if not foe.clear and foe.dist > 30:
                 # Close in along a route rather than strafing into a wall.
                 waypoint = self.route(pos, foe.pos[:2], zone, radius, height, now < self.stuck_until,
@@ -385,14 +393,14 @@ class DuelBot(Bot):
             action["boost"] = bool(boosting) and not charging
         return action
 
-    def cube_goal(self, obs, pos, zone):
+    def cube_goal(self, obs, pos, zone, reach=140.0):
         best, goal = math.inf, None
         for item in seq(obs.get("cubes"))[:40]:
             p = vec(obj(item).get("pos"), 3)
             if p is None or abs(p[2] - pos[2]) > 10 or zone.gap(p, 6) < 3:
                 continue
             d = distance(pos, p)
-            if d < 140 and d < best:
+            if d < reach and d < best:
                 best, goal = d, p[:2]
         return goal
 
