@@ -10,6 +10,7 @@ import example_bot as eb
 import duel_bot
 import math
 import time
+from typing import NamedTuple
 
 # Deterministic play: wide time caps so per-call work limits decide, not the wall clock.
 eb.PLAN_BUDGET_S = 0.010
@@ -22,40 +23,85 @@ GUARDED_OPENER = True       # squad play fights only mechs that attack or close 
 PAUSE_MED_MS = 8.0
 PAUSE_MIN_MS = 4.0
 PAUSE_SHOW = True
+USE_PAUSE = True
+USE_E = True
+USE_R = True
+USE_H2 = True
+
+
+def mech_attacker(event, slot):
+    source = number(event.get("by"), -1)
+    if (event.get("type") == "damaged" and event.get("weapon") not in ("zone", "npc")
+            and 0 <= source < 16 and source == int(source) and source != slot
+            and number(event.get("amount")) > 0):
+        return source
+
+
+def segment_distance_sq(pos, end, point):
+    dx, dy = end[0] - pos[0], end[1] - pos[1]
+    px, py = point[0] - pos[0], point[1] - pos[1]
+    span = dx * dx + dy * dy
+    along = limit((px * dx + py * dy) / span, 0, 1) if span else 0
+    return (px - along * dx) ** 2 + (py - along * dy) ** 2
 
 
 class Detector:
-    """Strict free-for-all detector: it must stay quiet in the squad game.
-
-    House bots never fight each other, so before the zone turns deadly a mech we did not kill
-    almost never dies, and no laser beam goes from one mech into another. Unseen drones can
-    cause HP loss, and lightning can arc to drones and crates too. Free-for-all once:
-      - median and minimum pauses between decisions both exceed their thresholds, or
-      - 2 deaths we did not cause while zone dps <= 35 (the first two phases), or
-      - 3 such deaths while zone dps <= 100, or
-      - laser beams from one mech ending on another, away from us and from drones and
-        crates, seen at 2 different times.
-    """
+    """Latch on the first pause, unexplained death, HP loss, crossfire or beam signal."""
 
     def __init__(self, hello):
         self.slot = number(hello.get("slot"), -1)
         self.start_alive = None
         self.kills = 0
         self.beam_times = []
+        self.seen_hp = {}
+        self.latest_attacker = None
         self.ffa = False
         self.reason = ""
         self.score = 0.0
+
+    def other_hp_drop(self, obs, events):
+        zone = obj(obs.get("zone"))
+        center, radius = vec(zone.get("center"), 2), number(zone.get("radius"), 0)
+        ours = {number(event.get("target"), None) for event in events if event.get("type") == "hit"}
+        previous, self.seen_hp = self.seen_hp, {}
+        for raw in seq(obs.get("mechs"))[:48]:
+            entry = obj(raw)
+            if entry.get("kind") != "mech":
+                continue
+            ident = number(entry.get("id"), None)
+            hp = number(entry.get("hp"), None)
+            if ident is None or ident == self.slot or hp is None:
+                continue
+            self.seen_hp[ident] = hp
+            if ident in ours or ident not in previous or number(entry.get("cubes"), None) != 0:
+                continue
+            if abs(previous[ident] - hp - 45.0) <= 1e-6 and center is not None:
+                point = vec(entry.get("pos"), 3)
+                if point is not None and distance(point, center) <= radius:
+                    return True
+        return False
+
+    def two_attackers(self, events, now):
+        for event in events:
+            source = mech_attacker(event, self.slot)
+            if source is None:
+                continue
+            if self.latest_attacker is not None:
+                other, when = self.latest_attacker
+                if source != other and 0 <= now - when <= 20 + 1e-9:
+                    return True
+            self.latest_attacker = source, now
+        return False
 
     def update(self, obs, now):
         if self.ffa:
             return True
         g_med, g_min = mf.pause_ms
-        if g_med is not None and g_med > PAUSE_MED_MS and g_min > PAUSE_MIN_MS:
+        if USE_PAUSE and now >= 1.2 and g_med is not None and g_med > PAUSE_MED_MS and g_min > PAUSE_MIN_MS:
             self.ffa, self.reason = True, f"pause {g_med:.1f}/{g_min:.1f} ms"
             return True
-        for event in seq(obs.get("events"))[:200]:
-            if obj(event).get("type") == "kill":
-                self.kills += 1
+        events = [obj(event) for event in seq(obs.get("events"))[:200]]
+        self.kills += sum(event.get("type") == "kill" for event in events)
         alive = number(obs.get("alive"), None)
         dps = number(obj(obs.get("zone")).get("dps"), 0)
         if alive is not None:
@@ -66,6 +112,18 @@ class Detector:
             if (others >= 2 and dps <= 35) or (others >= 3 and dps <= 100):
                 self.ffa, self.reason = True, f"{others} deaths not ours at {now:.1f}s (dps {dps:.0f})"
                 return True
+            if USE_E and others >= 1 and now < 150:
+                self.ffa, self.reason = True, f"death not ours before 150s at {now:.1f}s"
+                return True
+        if USE_R and self.other_hp_drop(obs, events):
+            self.ffa, self.reason = True, f"other mech lost 45 HP at {now:.1f}s"
+            return True
+        if USE_H2 and self.kills == 0 and self.two_attackers(events, now):
+            self.ffa, self.reason = True, f"two mechs hit us before our first kill at {now:.1f}s"
+            return True
+        beams = seq(obs.get("beams"))[:32]
+        if not beams:
+            return False
         me = vec(obj(obs.get("self")).get("pos"), 3)
         if me is None:
             return False
@@ -78,7 +136,7 @@ class Detector:
                 continue
             (mechs if entry.get("kind") == "mech" else others_near).append((ident, p))
         others_near += [(None, p) for item in seq(obs.get("crates"))[:40] if (p := vec(obj(item).get("pos"), 3)) is not None]
-        for beam in seq(obs.get("beams"))[:32]:
+        for beam in beams:
             beam = obj(beam)
             if beam.get("kind") != "laser":
                 continue
@@ -97,6 +155,14 @@ class Detector:
         return self.ffa
 
 
+class Sighting(NamedTuple):
+    time: float
+    pos: tuple
+    weapons: tuple
+    cubes: float | None
+    hp: float | None
+
+
 class Selective(eb.Bot):
     SEPARATION = 145.0
     UPGRADES = (
@@ -109,7 +175,9 @@ class Selective(eb.Bot):
         ("laser_damage", "plating", "armor"),
         ("armor", "plating", "laser_damage"),
     )
-    SECONDARIES = ("laser", "lightning")
+    SECONDARIES = ("laser", "lightning", "mortar")
+    PICKUP_CLEARANCE = 100.0
+    OPENING_CLEARANCE = 120.0
 
     def __init__(self, hello):
         super().__init__(hello)
@@ -117,125 +185,180 @@ class Selective(eb.Bot):
         self.pickups = {}
         self.visible_pickups = {}
         self.last_seen = {}
+        self.eliminated = set()
+        self.attackers = {}
         self.rivals = []
+        self.first_ffa_time = None
         self.goal = None
         self.goal_until = -math.inf
         self.last_mech_damage = -math.inf
+        self.last_near_sound = -math.inf
+        self.heard_rival = None
         vision = obj(obj(hello.get("config")).get("vision"))
         self.vision = limit(number(vision.get("range"), 200), 45, 350)
         self.near_vision = limit(number(vision.get("near_range"), 45), 5, 100)
         self.half_fov = math.radians(limit(number(vision.get("fov_deg"), 120), 10, 360) / 2)
         self.mode = "survive"
 
-    def observe(self, obs, me, pos, actual, now):
-        previous = self.last_seen
-        self.last_seen = {i: (t, p) for i, (t, p) in previous.items() if 0 <= now - t < 3}
-        self.enemy_cubes = {}
+    def record(self, obs, pos, now):
+        """Update bounded observation history without running any policy or map queries."""
+        kills = set()
+        for raw in seq(obs.get("events"))[:200]:
+            event = obj(raw)
+            kind = event.get("type")
+            if kind == "kill":
+                ident = number(event.get("target"), None)
+                if ident is not None and 0 <= ident < 16:
+                    kills.add(ident)
+                    self.last_seen.pop(ident, None)
+            elif kind == "took" or (kind == "take_failed" and event.get("reason") == "gone"):
+                self.pickups.pop(number(event.get("id"), None), None)
+            source = mech_attacker(event, self.slot)
+            if source is not None:
+                self.last_mech_damage = now
+                yaw = number(event.get("bearing"), None)
+                point = None if pos is None or yaw is None else (
+                    pos[0] + 100 * math.cos(yaw), pos[1] + 100 * math.sin(yaw), pos[2]
+                )
+                self.attackers[source] = now, point
+        self.eliminated.update(kills)
+
         for raw in seq(obs.get("mechs"))[:48]:
             enemy = obj(raw)
             ident, point = number(enemy.get("id"), None), vec(enemy.get("pos"), 3)
-            if enemy.get("kind") == "mech" and ident is not None and ident != self.slot and point is not None:
-                self.last_seen[ident] = now, point
-                self.enemy_cubes[ident] = limit(number(enemy.get("cubes"), 0), 0, 100)
-        if self.alive == 2 and self.enemy_cubes:
-            self.last_seen = {i: self.last_seen[i] for i in self.enemy_cubes}
-        self.rivals = sorted((distance(pos, p), p) for _, p in self.last_seen.values())[:16]
-        self.heard_rival = None
-        for raw in seq(obs.get("sounds"))[:40]:
-            sound = obj(raw)
-            reach = {"near": 42, "mid": 100}.get(sound.get("dist")) if isinstance(sound.get("dist"), str) else None
-            yaw = number(sound.get("bearing"), None)
-            if (reach and yaw is not None and number(sound.get("age"), 0) < 0.45
-                    and sound.get("kind") in ("gun", "laser", "laser_charge", "lightning", "mortar", "boost", "step")):
-                self.heard_rival = pos[0] + reach * math.cos(yaw), pos[1] + reach * math.sin(yaw), pos[2]
-                break
-
-        if "laser" in self.kinds:
-            self.pickups.clear()
-            return
+            if (enemy.get("kind") == "mech" and ident is not None and 0 <= ident < 16 and ident == int(ident) and ident != self.slot
+                    and ident not in self.eliminated and point is not None):
+                self.last_seen[ident] = Sighting(now, point, tuple(seq(enemy.get("weapons"))[:2]),
+                                                number(enemy.get("cubes"), None), number(enemy.get("hp"), None))
         visible = {}
         for raw in seq(obs.get("pickups"))[:64]:
             item = obj(raw)
             ident, point = number(item.get("id"), None), vec(item.get("pos"), 3)
-            if ident is not None and ident >= 0 and point is not None and item.get("kind") in self.SECONDARIES:
+            if ident is not None and ident >= 0 and point is not None and item.get("kind") in duel_bot.KNOWN_WEAPONS:
                 visible[ident] = (now, item["kind"], point)
-        for raw in seq(obs.get("events"))[:40]:
-            event = obj(raw)
-            if event.get("type") == "take_failed" and event.get("reason") == "gone":
-                self.pickups.pop(number(event.get("id"), None), None)
-        eye = raised(pos, self.phys("eye_height", 8, obj(me.get("stats"))))
-        remembered = {}
-        for ident, record in self.pickups.items():
-            t, _, point = record
-            if ident in visible or not 0 <= now - t <= 22:
-                continue
-            d = distance(pos, point)
-            expected = d <= self.near_vision - 3 or (
-                d <= self.vision - 10 and abs(angle(bearing(pos, point) - actual[0])) < self.half_fov - 0.10
-            )
-            if not expected or (self.arena is not None and not self.arena.clear_ray(eye, raised(point, 0.5))):
-                remembered[ident] = record
-        remembered.update(visible)
-        self.pickups = dict(list(remembered.items())[-64:])
         self.visible_pickups = visible
+        self.pickups.update(visible)
+        if len(self.pickups) > 128:
+            self.pickups = dict(sorted(self.pickups.items(), key=lambda item: item[1][0])[-128:])
 
-    def clear_approach(self, pos, goal, clearance):
-        dx, dy = goal[0] - pos[0], goal[1] - pos[1]
-        span = max(0.01, dx * dx + dy * dy)
-        rivals = self.rivals
-        if not rivals and self.heard_rival is not None:
-            rivals = [(distance(pos, self.heard_rival), self.heard_rival)]
-        for here, enemy in rivals:
-            along = limit(((enemy[0] - pos[0]) * dx + (enemy[1] - pos[1]) * dy) / span, 0, 1)
-            nearest = pos[0] + along * dx, pos[1] + along * dy
-            if (distance(nearest, enemy) < min(clearance, here - 1)
-                    or distance(goal, enemy) < min(clearance, here + 10)):
+        for raw in seq(obs.get("sounds"))[:40]:
+            sound = obj(raw)
+            band, kind = sound.get("dist"), sound.get("kind")
+            if band not in ("near", "mid") or kind not in (
+                    "gun", "mortar", "explosion", "laser", "laser_charge", "lightning", "jet", "boost", "step", "reload"):
+                continue
+            heard = now - max(0, number(sound.get("age")))
+            if heard > self.last_near_sound and now - heard <= 2:
+                self.last_near_sound = heard
+                yaw = number(sound.get("bearing"), None)
+                reach = 42 if band == "near" else 100
+                self.heard_rival = None if pos is None or yaw is None else (
+                    pos[0] + reach * math.cos(yaw), pos[1] + reach * math.sin(yaw), pos[2]
+                )
+
+    def observe(self, me, pos, actual, now):
+        self.known_enemies = {i: entry.pos for i, entry in self.last_seen.items()}
+        self.escape_attackers = {}
+        for ident, (when, estimate) in self.attackers.items():
+            if ident in self.eliminated or not 0 <= now - when <= 10:
+                continue
+            seen = self.last_seen.get(ident)
+            point = seen.pos if seen and (estimate is None or seen.time >= when - 1) else estimate
+            if point is not None:
+                self.known_enemies[ident] = point
+            self.escape_attackers[ident] = point
+        self.disengage = len(self.escape_attackers) >= 2
+
+        self.near_sound = 0 <= now - self.last_near_sound <= 2
+        recent = {i for i, entry in self.last_seen.items() if 0 <= now - entry.time < 3}
+        if self.alive == 2 and recent:
+            most_recent = max(self.last_seen[i].time for i in recent)
+            recent = {i for i in recent if self.last_seen[i].time == most_recent}
+            self.known_enemies = {i: p for i, p in self.known_enemies.items() if i in recent}
+        active = self.known_enemies if self.opening else {
+            i: p for i, p in self.known_enemies.items() if i in recent or i in self.escape_attackers
+        }
+        self.rivals = sorted((distance(pos, p), p) for p in active.values())
+        if not self.rivals and self.near_sound and self.heard_rival is not None:
+            self.rivals = [(distance(pos, self.heard_rival), self.heard_rival)]
+        self.farm_blocked = (0 <= now - self.last_mech_damage <= 3 or self.near_sound
+                             or any(distance(pos, self.last_seen[i].pos) <= 110 for i in recent))
+
+        if "laser" not in self.kinds and self.pickups:
+            eye = raised(pos, self.phys("eye_height", 8, obj(me.get("stats"))))
+            sensors = seq(me.get("upgrades")).count("sensors")
+            for ident, (_, _, point) in list(self.pickups.items()):
+                if ident in self.visible_pickups:
+                    continue
+                d = distance(pos, point)
+                expected = d <= self.near_vision + 15 * sensors - 3 or (
+                    d <= self.vision + 25 * sensors - 10
+                    and abs(angle(bearing(pos, point) - actual[0])) < self.half_fov - 0.10
+                )
+                if expected and (self.arena is None or self.arena.clear_ray(eye, raised(point, 0.5))):
+                    del self.pickups[ident]
+
+    def clear_approach(self, pos, goal, clearance, strict=False):
+        for d, enemy in self.rivals:
+            minimum = clearance if strict else min(clearance, max(0, d - 1))
+            if segment_distance_sq(pos, goal, enemy) <= minimum ** 2:
+                return False
+            if not strict and distance(goal, enemy) < min(clearance, d + 10):
                 return False
         return True
+
+    def safe_pickup_route(self, pos, goal):
+        return all(segment_distance_sq(pos, goal, enemy) > self.PICKUP_CLEARANCE ** 2
+                   for enemy in self.known_enemies.values())
 
     def weapon_goal(self, pos, zone, weapons, urgent, action):
         if "laser" in self.kinds:
             return None
         spare = next((i for i, w in enumerate(weapons) if not w.get("kind")), None)
-        swap = next((i for i, w in enumerate(weapons) if w.get("kind") in ("lightning", "mortar")), None)
-        if spare is None and swap is None:
+        swap = next((i for i, w in enumerate(weapons) if w.get("kind") in self.SECONDARIES), None)
+        if urgent or (spare is None and swap is None):
             return None
-        options = []
+        best = None
         reach = limit(number(self.loot.get("pickup_radius"), 4), 0.5, 15)
         for ident, (_, kind, point) in self.pickups.items():
-            if kind in self.kinds:
+            if kind not in self.SECONDARIES or kind in self.kinds:
+                continue
+            priority = self.SECONDARIES.index(kind)
+            if spare is None and priority >= self.SECONDARIES.index(weapons[swap]["kind"]):
                 continue
             d, climb = distance(pos, point), point[2] - pos[2]
-            if d <= reach - 0.15 and abs(climb) <= 3.5 and ident in self.visible_pickups:
-                options.append((kind != "laser", 0, ident, point))
-            elif (not urgent and d < 8 and abs(climb) <= 3.5 and ident in self.visible_pickups
-                  and (not self.rivals or self.rivals[0][0] > 65)
-                  and zone.gap(point, 2) > 2):
-                options.append((kind != "laser", d, ident, point))
-            elif (not urgent and -65 <= climb <= 36 and (climb <= 4 or self.energy > 45)
-                  and d < (70 if "lightning" in self.kinds else 240)
-                  and zone.gap(point, d / 9 + 4) > min(3, zone.radius * 0.12)
-                  and self.clear_approach(pos, point, 120)):
-                outside = max(0, distance(point, zone.next_center) - zone.next_radius + 10)
-                options.append((kind != "laser", d + max(0, climb - 4) * 2 + outside * 0.55, ident, point))
-        if not options:
+            if d > 150 or not -65 <= climb <= 36 or (climb > 4 and self.energy <= 45):
+                continue
+            take = math.hypot(d, climb) <= reach and ident in self.visible_pickups
+            outside = max(0, distance(point, zone.next_center) - zone.next_radius + 10)
+            cost = 0 if take else d + max(0, climb - 4) * 2 + outside * 0.55
+            option = priority, cost, ident, point, take
+            if (best is None or option < best) and zone.gap(point, 0 if take else d / 9 + 4) > 0:
+                if self.safe_pickup_route(pos, point):
+                    best = option
+        if best is None:
             return None
-        _, cost, ident, point = min(options)
-        if cost == 0:
+        _, _, ident, point, take = best
+        self.mode = "arm"
+        if take:
             action["take"] = ident
             if spare is None:
                 action["drop"] = swap
-            return None
+            return pos[:2]
         self.weapon_point = point
-        self.mode = "arm"
         return point[:2]
 
     def loot_goal(self, obs, pos, zone, contacts, weapons, hp_fraction, cubes, safe, urgent, action):
+        if self.disengage:
+            self.mode = "escape"
+            self.goal = self.search = self.route_goal = None
+            self.path, self.path_index = (), 0
+            return None
         goal = self.weapon_goal(pos, zone, weapons, urgent, action)
         if goal is not None:
             return goal
         nearest = self.rivals[0][0] if self.rivals else math.inf
-        quiet = nearest >= self.SEPARATION and self.heard_rival is None and zone.now - self.last_mech_damage > 3
+        quiet = nearest >= self.SEPARATION and not self.farm_blocked
         if urgent or not quiet:
             return None
         options = []
@@ -243,7 +366,9 @@ class Selective(eb.Bot):
             point = vec(obj(raw).get("pos"), 3)
             if point is not None and abs(point[2] - pos[2]) < 4:
                 d = distance(pos, point)
-                if d < 135 and zone.gap(point, d / 9 + 3) > 2 and self.clear_approach(pos, point, self.SEPARATION):
+                if (d < 135 and zone.gap(point, d / 9 + 3) > 2
+                        and (not self.opening or distance(point, zone.next_center) < zone.next_radius)
+                        and self.clear_approach(pos, point, self.SEPARATION, strict=self.opening)):
                     options.append((d, point[:2]))
         for raw in seq(obs.get("drops"))[:8]:
             item = obj(raw)
@@ -252,7 +377,9 @@ class Selective(eb.Bot):
                 continue
             d = distance(pos, point)
             if (d < 110 and number(item.get("lands_in"), 0) < d / 10 + 1
-                    and zone.gap(point, d / 9 + 10) > 4 and self.clear_approach(pos, point, 165)):
+                    and zone.gap(point, d / 9 + 10) > 4
+                    and (not self.opening or distance(point, zone.next_center) < zone.next_radius)
+                    and self.clear_approach(pos, point, 165, strict=self.opening)):
                 options.append((d * 0.60 - 14 - 24 * (1 - hp_fraction), point[:2]))
         if options:
             self.mode = "loot"
@@ -275,12 +402,15 @@ class Selective(eb.Bot):
         return None
 
     def shelter_point(self, pos, zone, contacts, direction, radius, height, now, until, terminal_burn):
+        if self.disengage:
+            return pos[:2]
         if terminal_burn:
             return super().shelter_point(pos, zone, contacts, direction, radius, height, now, until, True)
         if self.farm is not None:
             return pos[:2]
         if self.goal is not None and now < self.goal_until and distance(pos, self.goal) > 3:
-            if all(distance(self.goal, p) >= min(120, d - 4) for d, p in self.rivals):
+            if (not self.opening or distance(self.goal, zone.next_center) < zone.next_radius) and (
+                    self.clear_approach(pos, self.goal, self.OPENING_CLEARANCE, strict=self.opening)):
                 return self.goal
 
         arena = self.arena
@@ -291,13 +421,13 @@ class Selective(eb.Bot):
         scout = self.scout_yaw + math.floor(now / 10) * 1.91
         sx, sy = math.cos(scout), math.sin(scout)
         enemies = self.rivals
-        if not enemies and self.heard_rival is not None:
-            enemies = [(distance(pos, self.heard_rival), self.heard_rival)]
         options = []
+        future_center, future_radius = zone.circle_in(7)
+        future_margin = min(5, zone.radius * 0.18)
         for run in (0, 26, 58):
             for dx, dy in eb.COVER_ANGLES if run else ((0, 0),):
                 point = pos[0] + dx * run, pos[1] + dy * run
-                if zone.gap(point, 7) < min(5, zone.radius * 0.18):
+                if future_radius - distance(point, future_center) < future_margin:
                     continue
                 cell = arena.cell(*point) if arena is not None else None
                 if run and arena is not None and not arena.ground_ok(cell, radius):
@@ -305,6 +435,8 @@ class Selective(eb.Bot):
                 base = arena.floor[cell] if run and cell is not None else pos[2]
                 gap = goal_radius - distance(point, zone.next_center)
                 score = min(0, gap) * 1.5 + min(18, max(0, gap)) * 0.15 - run * 0.16
+                if self.opening and gap < goal_radius - zone.next_radius:
+                    score -= 110
                 if roam and next_gap > -28:
                     score += run * (0.22 + (dx * sx + dy * sy) * 0.15)
                 if cell is not None:
@@ -314,6 +446,8 @@ class Selective(eb.Bot):
                     separation = distance(point, enemy)
                     score -= max(0, self.SEPARATION - separation) * (1.5 if d < 125 else 0.85)
                     score -= max(0, 64 - separation) * 1.8
+                    if self.opening and run and segment_distance_sq(pos, point, enemy) <= min(d - 0.1, self.OPENING_CLEARANCE) ** 2:
+                        score -= 45
                     if self.alive == 2 and self.fight is not None:
                         preferred = 152 if "laser" in self.kinds else 125
                         score -= abs(separation - preferred) * 1.2
@@ -333,6 +467,8 @@ class Selective(eb.Bot):
         return best
 
     def route(self, pos, goal, zone, radius, height, stuck, until):
+        if self.disengage:
+            return goal
         arena, pickup = self.arena, self.weapon_point
         if (arena is not None and pickup is not None and pickup[:2] == goal
                 and 3.5 < pickup[2] - pos[2] and distance(pos, pickup) < 30
@@ -340,13 +476,69 @@ class Selective(eb.Bot):
             self.climb = True
             return goal
         waypoint = super().route(pos, goal, zone, radius, height, stuck, until)
-        if (waypoint != goal and self.rivals and not self.clear_approach(pos, waypoint, 105)
-                and zone.gap(pos, 3) > 8):
+        if pickup is not None:
+            points = self.path[self.path_index:] if self.path and self.route_goal == goal else ()
+            if not self.safe_pickup_route(pos, waypoint) or any(
+                    not self.safe_pickup_route(start, end) for start, end in zip(points, points[1:])):
+                self.weapon_point = None
+                self.mode = "survive"
+                self.search = self.route_goal = None
+                self.path, self.path_index = (), 0
+                return self.shelter_point(pos, zone, (), None, radius, height, zone.now, until, False)
+        elif waypoint != goal and not self.clear_approach(pos, waypoint, self.OPENING_CLEARANCE if self.opening else 105):
+            if zone.gap(pos, 3) <= 8:
+                return waypoint
             return self.shelter_point(pos, zone, (), None, radius, height, zone.now, until, False)
         return waypoint
 
+    def escape_move(self, pos, vel, goal, zone, hazards, stats, grounded, energy, urgent):
+        arena = self.arena
+        radius = limit(self.phys("radius", 2.5, stats), 0.5, 25)
+        height = limit(self.phys("height", 9, stats), 1, 80)
+        boost = grounded and energy > eb.BOOST_RESERVE
+        pace = limit(self.phys("boost_speed" if boost else "walk_speed", 19.5 if boost else 11.7, stats), 2, 90)
+        attackers = [(distance(pos, point), point) for point in self.escape_attackers.values() if point is not None]
+        self.escape_bearings = [(span, bearing(pos, point)) for span, point in attackers]
+        best, move = None, (0.0, 0.0)
+        center, size = zone.circle_in(1.5)
+        gap = size - distance(pos, center)
+        next_gap = zone.next_radius - distance(pos, zone.next_center)
+        for dx, dy in eb.COVER_ANGLES:
+            end = pos[0] + dx * pace * 0.58 + vel[0] * 0.12, pos[1] + dy * pace * 0.58 + vel[1] * 0.12
+            if arena is not None and not arena.corridor(pos, end, radius, height):
+                continue
+            end_gap = size - distance(end, center)
+            min_gap = gap + 0.1 if urgent and gap < 0 else min(-0.2, gap - 0.2)
+            if end_gap < min_gap:
+                continue
+            gains = [distance(end, point) - span for span, point in attackers]
+            worst = min(gains, default=0.0)
+            score = sum(gains) + 2 * worst
+            if urgent:
+                score += 4 * (distance(pos, goal) - distance(end, goal))
+            if self.opening and next_gap < 20:
+                score += min(0, zone.next_radius - distance(end, zone.next_center)) - min(0, next_gap)
+            for impact, seconds, reach in hazards:
+                future = pos[0] + dx * pace * seconds, pos[1] + dy * pace * seconds
+                score -= 2.1 * max(0, reach - distance(future, impact))
+            if arena is not None:
+                body = end[0], end[1], pos[2] + height * 0.65
+                score += 28 * sum(not arena.clear_ray(raised(point, 8), body) for _, point in attackers)
+            option = (worst > 0, score)
+            if best is None or option > best:
+                best, move = option, (dx, dy)
+        if best is None:
+            return None
+        return {"move": list(move), "boost": boost, "jump": False}
+
     def movement(self, pos, vel, waypoint, zone, urgent, evade, threats, hazards, direction, stats,
                  grounded, energy, now, until, in_zone, terminal_burn, drop_hint):
+        if self.disengage:
+            escape = self.escape_move(pos, vel, waypoint, zone, hazards, stats, grounded, energy, urgent)
+            if escape is not None:
+                self.course = escape["move"]
+                self.sprinting = escape["boost"]
+                return escape
         nearest = self.rivals[0][0] if self.rivals else math.inf
         running = (nearest < 118 and self.fight is None and self.weapon_point is None
                    and (distance(pos, waypoint) > eb.HOLD_M or any(c.clear for c in threats)))
@@ -355,30 +547,116 @@ class Selective(eb.Bot):
         if self.climb:
             course = bearing(pos, waypoint)
             speed = 0.33 if self.weapon_point[2] - pos[2] > 7 else 0.75
-            return {"move": [speed * math.cos(course), speed * math.sin(course)],
+            move = {"move": [speed * math.cos(course), speed * math.sin(course)],
                     "jump": grounded, "boost": not grounded}
-        if (running or (self.weapon_point is not None and nearest > 135)) and grounded and energy > 35:
-            if distance(pos, waypoint) > 12 and not move.get("jump"):
-                move["boost"] = True
-        self.cornered = (nearest < 34 and self.weapon_point is None and (
-            zone.radius < 48 or (now < self.stuck_until and not move.get("boost"))
-            or distance(pos, waypoint) < 4
-        ))
+        if self.weapon_point is not None:
+            projected = pos[0] + 12 * move["move"][0], pos[1] + 12 * move["move"][1]
+            if not self.safe_pickup_route(pos, projected):
+                self.weapon_point = None
+                self.mode = "survive"
+                cover = self.shelter_point(pos, zone, (), direction, self.phys("radius", 2.5, stats),
+                                           self.phys("height", 9, stats), now, until, terminal_burn)
+                move = super().movement(pos, vel, cover, zone, urgent, evade, threats, hazards, direction,
+                                        stats, grounded, energy, now, until, in_zone, terminal_burn, drop_hint)
+        if ((running or self.weapon_point is not None) and grounded and energy > eb.BOOST_RESERVE
+                and distance(pos, waypoint) > 7 and not move.get("jump")):
+            move["boost"] = True
+        self.course = move["move"]
+        self.sprinting = bool(move.get("boost"))
         return move
 
+    def no_escape(self, pos, enemy, zone):
+        radius = self.phys("radius", 2.5, self.self_stats)
+        height = self.phys("height", 9, self.self_stats)
+        span = distance(pos, enemy.pos)
+        center, size = zone.circle_in(0.8)
+        for dx, dy in eb.COVER_ANGLES:
+            end = pos[0] + 8 * dx, pos[1] + 8 * dy
+            if distance(end, center) > size or distance(end, enemy.pos) <= span + 1:
+                continue
+            if self.arena is None or self.arena.corridor(pos, end, radius, height):
+                return False
+        return True
+
+    def finish_damage(self, enemy, pos):
+        """Estimate landed damage in 1.5 s with our current magazines, cooldowns and aim."""
+        total = 0.0
+        muzzle = self.phys("muzzle_height", 7, self.self_stats)
+        pitch = self.phys("min_pitch", -0.7, self.self_stats), self.phys("max_pitch", 1.3, self.self_stats)
+        turn = max(0.1, self.phys("turn_rate", 4, self.self_stats))
+        pitch_rate = max(0.1, self.phys("pitch_rate", 3, self.self_stats))
+        for weapon in self.weapon_slots:
+            kind = weapon.get("kind")
+            if kind not in duel_bot.KNOWN_WEAPONS or (kind == "laser" and self.sprinting and not number(weapon.get("charge"))):
+                continue
+            if kind == "lightning" and self.energy < eb.BOOST_RESERVE:
+                continue
+            plan = self.aim_for(weapon, enemy, pos, muzzle, pitch)
+            if plan is None:
+                continue
+            stats, defaults = obj(weapon.get("stats")), obj(self.weapon_config.get(kind))
+            cooldown, damage = {"gun": (0.24, 45), "laser": (1.65, 315),
+                                "mortar": (2.1, 200), "lightning": (0.25, 60)}[kind]
+            interval = max(self.dt, number(stats.get("cooldown"), number(defaults.get("cooldown"), cooldown)))
+            damage = number(stats.get("damage"), number(defaults.get("damage"), damage))
+            aim_time = max(0, abs(angle(plan[0] - self.actual[0])) - plan[2]) / turn
+            if kind != "lightning":
+                aim_time = max(aim_time, (abs(plan[1] - self.actual[1]) - plan[3]) / pitch_rate)
+            first = max(aim_time, number(weapon.get("cooldown")), number(weapon.get("reload")))
+            if kind == "laser":
+                charge = number(weapon.get("charge"))
+                full_charge = number(stats.get("charge"), number(defaults.get("charge"), 0.75))
+                first = max(first, full_charge - charge) if charge else first + full_charge
+            if kind in ("gun", "mortar"):
+                speed = number(stats.get("speed"), number(defaults.get("speed"), 252 if kind == "gun" else 72))
+                first += enemy.dist / max(1, speed * (0.8 if kind == "mortar" else 1))
+            shots = max(0, 1 + math.floor((1.5 - first) / interval))
+            if kind == "gun":
+                shots = min(shots, max(0, number(weapon.get("ammo"), 12)))
+            reliability = {"gun": 0.72, "laser": 0.90, "mortar": 0.45, "lightning": 0.95}[kind]
+            total += shots * damage * reliability
+        return total
+
     def target(self, obs, pos, contacts, fraction, zone, must_move, safe, terminal_burn, repairing, incoming):
-        if self.cornered or terminal_burn:
-            nearby = [c for c in contacts if c.kind == "mech" and c.clear and c.dist < (195 if terminal_burn else 48)]
-            if nearby:
-                return [(100, min(nearby, key=lambda c: c.dist))]
-        if self.fight is not None:
-            return [(100, self.fight)]
-        return [(50, self.farm)] if self.farm is not None else []
+        options = []
+        now = zone.now
+        for enemy in contacts:
+            if enemy.kind != "mech" or not enemy.clear or enemy.id in self.eliminated:
+                continue
+            if self.disengage:
+                dx, dy = self.course
+                end = pos[0] + 25 * dx, pos[1] + 25 * dy
+                if (enemy.dist > 30 or (enemy.pos[0] - pos[0]) * dx + (enemy.pos[1] - pos[1]) * dy <= 0
+                        or segment_distance_sq(pos, end, enemy.pos) > (enemy.scale * 2.5 + 4) ** 2):
+                    continue
+            when, _ = self.attackers.get(enemy.id, (-math.inf, None))
+            if 0 <= now - when <= 6 or enemy is self.fight:
+                options.append((100 - enemy.dist * 0.1, enemy))
+                continue
+            if enemy.dist <= 30:
+                dx, dy = pos[0] - enemy.pos[0], pos[1] - enemy.pos[1]
+                if dx * enemy.vel[0] + dy * enemy.vel[1] > 0 and self.no_escape(pos, enemy, zone):
+                    options.append((100 - enemy.dist * 0.1, enemy))
+                    continue
+            if (math.isfinite(enemy.hp) and not self.near_sound
+                    and all(i == enemy.id or distance(pos, point) > 150 and distance(enemy.pos, point) > 150
+                            for i, point in self.known_enemies.items())
+                    and enemy.hp < self.finish_damage(enemy, pos)):
+                options.append((115 - enemy.dist * 0.1, enemy))
+        if options:
+            return sorted(options, key=lambda option: option[0], reverse=True)
+        return [(50, self.farm)] if self.farm is not None and not self.farm_blocked else []
+
+    def aim_for(self, weapon, target, base, muzzle, pitch_bounds):
+        # A charging laser fires on release, so farm with a weapon we can stop immediately.
+        if target.kind != "mech" and weapon.get("kind") != "gun":
+            return None
+        return super().aim_for(weapon, target, base, muzzle, pitch_bounds)
 
     def contacts(self, obs, pos, eye):
         contacts = super().contacts(obs, pos, eye)
         self.exposed = any(c.kind == "mech" and c.clear and c.dist < 100 for c in contacts)
-        if self.alive == 3 or (self.alive > 3 and self.kinds.isdisjoint(self.SECONDARIES)):
+        if self.alive != 2 or self.disengage:
             return contacts
         for enemy in sorted(contacts, key=lambda c: c.hp):
             if (enemy.kind != "mech" or not enemy.clear or not enemy.armed
@@ -390,55 +668,93 @@ class Selective(eb.Bot):
                 continue
             long_range = 108 <= enemy.dist <= (200 if laser else 158)
             advantage = self.hp / max(1, enemy.hp)
-            cube_edge = min(self.cube_count, 21) - min(self.enemy_cubes.get(enemy.id, 0), 21)
+            seen = self.last_seen.get(enemy.id)
+            cube_edge = min(self.cube_count, 21) - min(limit(seen.cubes or 0, 0, 100), 21) if seen else self.cube_count
             advantage *= 1 + 0.022 * cube_edge
             if laser and not their_laser:
                 advantage *= 1.45
             if "lightning" in enemy.armed and "lightning" not in self.kinds and enemy.dist < 55:
                 advantage *= 0.65
-            alone = all(distance(enemy.pos, p) < 1 or d >= 175 for d, p in self.rivals)
-            if self.alive == 2:
-                allowed = ((long_range and advantage >= 0.93)
-                           or (enemy.dist >= 60 and advantage > 1.65)
-                           or (enemy.dist < 40 and "lightning" in self.kinds and advantage > 1.3))
-            else:
-                allowed = long_range and alone and advantage >= 1.9
+            allowed = ((long_range and advantage >= 0.93)
+                       or (enemy.dist >= 60 and advantage > 1.65)
+                       or (enemy.dist < 40 and "lightning" in self.kinds and advantage > 1.3))
             if allowed:
                 self.fight = enemy
                 break
         return contacts
 
+    def escape_facing(self):
+        weighted = sorted(self.escape_bearings)
+        if not weighted:
+            return self.actual[0]
+        yaw = weighted[0][1]
+        if len(weighted) > 1:
+            yaw = angle(yaw + angle(weighted[1][1] - yaw) * 0.5)
+        return yaw
+
+    def release_laser_safely(self, obs, action, pos):
+        # A false trigger releases an existing charge. Hold only until the beam
+        # clears any visible unauthorized target, then release and regain speed.
+        for index, weapon in enumerate(self.weapon_slots):
+            if weapon.get("kind") != "laser" or number(weapon.get("charge")) <= 0 or action["fire"][index]:
+                continue
+            muzzle = raised(pos, self.phys("muzzle_height", 7, self.self_stats))
+            yaw, pitch = self.actual
+            for raw in (*seq(obs.get("mechs"))[:48], *seq(obs.get("crates"))[:36]):
+                item = obj(raw)
+                point = vec(item.get("pos"), 3)
+                ident = number(item.get("id"), None)
+                if point is None or ident in (self.slot, self.last_fire_target):
+                    continue
+                span = distance(muzzle, point)
+                width = 3 + 0.13 * limit(number(item.get("cubes")), 0, 100)
+                if (span <= 280 and abs(angle(yaw - bearing(muzzle, point))) <= math.atan2(width, span)
+                        and point[2] - 1 <= muzzle[2] + span * math.tan(pitch) <= point[2] + 4 * width):
+                    action["fire"][index] = True
+                    action["aim"][1] = self.phys("max_pitch", 1.3, self.self_stats)
+                    break
+
     def act(self, obs):
         errors = (ArithmeticError, LookupError, TypeError, ValueError, AttributeError)
         self.mode = "survive"
         self.weapon_point = self.fight = self.farm = None
-        self.climb = self.cornered = False
+        self.climb = self.sprinting = False
+        self.course = (0.0, 0.0)
+        self.escape_bearings = []
         me = obj(obs.get("self"))
         now, pos = number(obs.get("t"), 0), vec(me.get("pos"), 3)
-        actual = vec(me.get("aim"), 2) or (0, 0)
+        self.actual = vec(me.get("aim"), 2) or (0, 0)
+        self.self_stats = obj(me.get("stats"))
         offer = seq(obj(obs.get("offer")).get("choices"))[:3]
         try:
-            self.kinds = {obj(w).get("kind") for w in seq(me.get("weapons"))[:2]
-                          if obj(w).get("kind") in duel_bot.KNOWN_WEAPONS}
+            if self.first_ffa_time is None:
+                self.first_ffa_time = now
+            self.opening = 0 <= now - self.first_ffa_time < 30
+            items = seq(me.get("weapons"))
+            self.weapon_slots = [obj(items[i]) if i < len(items) else {} for i in range(2)]
+            self.kinds = {w.get("kind") for w in self.weapon_slots if w.get("kind") in duel_bot.KNOWN_WEAPONS}
             self.alive = number(obs.get("alive"), 16)
             self.hp = max(0, number(me.get("hp"), 0))
             self.hp_share = self.hp / max(1, number(me.get("max_hp"), 1400))
             self.cube_count = limit(number(me.get("cubes")), 0, 100)
             self.energy = limit(number(me.get("energy")), 0, 1000)
-            for raw in seq(obs.get("events"))[:40]:
-                event = obj(raw)
-                if (event.get("type") == "damaged" and event.get("weapon") not in ("zone", "npc")
-                        and number(event.get("by"), 0) < 100):
-                    self.last_mech_damage = now
+            self.record(obs, pos, now)
             if pos is not None:
-                self.observe(obs, me, pos, actual, now)
+                self.observe(me, pos, self.actual, now)
+                # Seed the inherited contact ranking with hits seen before the switch.
+                self.hits.update({ident: when for ident, (when, _) in self.attackers.items()
+                                  if 0 <= now - when < eb.HIT_MEMORY_S})
             self.last_fire_target = None
             action = super().act(obs)
-            if self.last_fire_target is None and pos is not None:
-                if self.weapon_point is not None and not self.exposed:
+            if pos is not None:
+                if self.disengage and self.last_fire_target is None:
+                    action["aim"] = [self.escape_facing(), 0.0]
+                elif self.last_fire_target is None and self.weapon_point is not None and not self.exposed:
                     action["aim"] = [bearing(pos, self.weapon_point), 0.0]
-                elif not self.rivals and now - self.last_damage >= eb.HIT_MEMORY_S:
+                elif self.last_fire_target is None and not self.rivals and now - self.last_damage >= eb.HIT_MEMORY_S:
                     action["aim"] = [angle(self.scout_yaw + now * 1.9), 0.0]
+                action.setdefault("fire", [False, False])
+                self.release_laser_safely(obs, action, pos)
         except errors:
             try:
                 self.duel.arena = self.arena
@@ -496,9 +812,17 @@ class Royale:
                     self.first_ffa = round(now, 1)
                 mf.log(f"mode {want}: {self.detector.reason}")
         if self.mode == "free-for-all":
-            return self.ffa.act(obs)
+            action = self.ffa.act(obs)
+            g_med, g_min = mf.pause_ms
+            if (PAUSE_SHOW and g_med is not None and 1.3 <= now < 3.7 and action.get("aim")
+                    and not self.ffa.disengage and not any(number(w.get("charge")) > 0 for w in self.ffa.weapon_slots)):
+                gap = g_med if now < 2.5 else g_min
+                action["aim"] = [math.radians(-170 + 5 * min(gap, 68)), 0.0]
+                action["fire"] = [False, False]
+            return action
+        self.ffa.record(obs, vec(obj(obs.get("self")).get("pos"), 3), now)
         return self.practice.act(obs)
 
 
 if __name__ == "__main__":
-    mf.run(Royale, pause_show=PAUSE_SHOW)
+    mf.run(Royale)

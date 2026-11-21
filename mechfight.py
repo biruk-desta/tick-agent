@@ -546,24 +546,14 @@ def _lines(fd):
         yield None, received if select.select([fd], [], [], 0)[0] else None
 
 
-def _encode_action(action, obs, pause_show):
-    g_med, g_min = pause_ms
-    now = obs.get("t")
-    if pause_show and g_med is not None and type(now) in (int, float) and 1.3 <= now < 3.7:
-        gap = g_med if now < 2.5 else g_min
-        action["aim"] = [math.radians(-170 + 5 * min(gap, 68)), 0.0]
-        action["fire"] = [False, False]
-    return _encode(action)
-
-
-def _decision(bot, obs, tick, pause_show):
+def _decision(bot, obs, tick):
     action = bot.act(obs)
     if isinstance(action, dict) and action:
-        return _encode_action({**action, "tick": tick}, obs, pause_show)
+        return _encode({**action, "tick": tick})
     return None
 
 
-def run(make_bot: Any, *, pause_show: bool = False) -> None:
+def run(make_bot: Any) -> None:
     """Run a bot until end or EOF, with a watchdog around each decision."""
     global pause_ms
     pause_ms = (None, None)
@@ -642,10 +632,10 @@ def run(make_bot: Any, *, pause_show: bool = False) -> None:
                     gaps = None
         last_tick = tick
         remaining = deadline - WRITE_RESERVE_S - time.perf_counter()
-        payload = (_watched(remaining, _decision, bot, obs, tick, pause_show)
+        payload = (_watched(remaining, _decision, bot, obs, tick)
                    if bot is not None and remaining > 0 else None)
         if payload is None or len(payload) > frame_limit:
-            payload = _encode_action(_fallback(obs, tick), obs, pause_show)
+            payload = _encode(_fallback(obs, tick))
         sent = _send(stdout, payload, deadline)
         last_sent = sent if valid_tick else None
 
