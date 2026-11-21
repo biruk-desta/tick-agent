@@ -56,6 +56,7 @@ class DuelBot(Bot):
         self.mode = "start"
         self.hp_share = 1.0
         self.dodging = False
+        self.guarded = False   # opener: fight only mechs that attack or close on us
         self.last_seen = {}        # mech id -> (time, pos)
         self.kill_spot = None      # (time, pos) where a victim died
         self.hunt_point = None     # (time, pos) best guess of where a hunter is
@@ -81,6 +82,8 @@ class DuelBot(Bot):
         farming_ok = self.hp_share >= 0.85
         mechs = [c for c in contacts if c.kind == "mech"]
         for c in contacts:
+            if c.kind == "mech" and self.guarded and not self.engaging_us(c, pos):
+                continue
             if c.kind == "mech":
                 share = c.hp / c.max_hp if math.isfinite(c.hp) else 1.0
                 rear = c.face_error > math.pi / 2
@@ -106,6 +109,16 @@ class DuelBot(Bot):
                 targets.append((20 + (300 - hp) * 0.06 - d * 0.27 + 8 * (ident == self.last_fire_target),
                                 Contact(ident, "crate", p, ZERO, None, hp, 300, 1, d, 0, True, False, False, ())))
         return sorted(targets, key=lambda choice: choice[0], reverse=True)[:4]
+
+    def engaging_us(self, c, pos):
+        """A mech that has hit us, is close, or is closing on us while facing us."""
+        if c.attacker or c.dist < 60:
+            return True
+        dx, dy = pos[0] - c.pos[0], pos[1] - c.pos[1]
+        d = math.hypot(dx, dy) or 1.0
+        closing = (c.vel[0] * dx + c.vel[1] * dy) / d
+        facing = c.aim is not None and abs(angle(c.aim[0] - bearing(c.pos, pos))) < 0.5
+        return c.dist < 140 and closing > 3.0 and facing
 
     # ----------------------------------------------------------------- movement
     def desired_range(self, kinds, foe):
@@ -250,6 +263,8 @@ class DuelBot(Bot):
         weapons = [obj(items[i]) if i < len(items) else {} for i in range(2)]
         kinds = {w.get("kind") for w in weapons if w.get("kind") in KNOWN_WEAPONS}
         mechs = [c for c in contacts if c.kind == "mech"]
+        if self.guarded:
+            mechs = [c for c in mechs if self.engaging_us(c, pos)]
         hunters = [c for c in mechs if c.dist < 170]
         visible = [c for c in hunters if c.clear]
         hazards = self.nearby_shells(obs, pos, velocity, height)
@@ -323,7 +338,7 @@ class DuelBot(Bot):
             elif self.kill_spot is not None and zone.gap(self.kill_spot[1], 5) > 3:
                 goal = self.kill_spot[1][:2]
                 self.mode = "spoils"
-            elif self.hunt_point is not None and fraction > REPAIR_TO and zone.gap(self.hunt_point[1], 5) > 3:
+            elif self.hunt_point is not None and not self.guarded and fraction > REPAIR_TO and zone.gap(self.hunt_point[1], 5) > 3:
                 goal = self.hunt_point[1][:2]
                 self.mode = "hunt"
             else:

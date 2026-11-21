@@ -8,9 +8,11 @@ policy; once it does we switch for the rest of the match.
 import mechfight as mf
 import example_bot as eb
 import duel_bot
-from example_bot import obj, seq, number, vec, distance
+from example_bot import obj, seq, number, vec, distance, bearing, angle
+import math
 
 FORCE_MODE = None           # None = detect; "practice" or "free-for-all" pins the policy
+GUARDED_OPENER = True       # squad play fights only mechs that attack or close on us
 
 
 class Detector:
@@ -82,10 +84,91 @@ class Detector:
         return self.ffa
 
 
+class Selective:
+    """Survive-first by default; take a fight only when it is a clear opportunity."""
+    OPP_SHARE = 0.40       # target health share at or below which it is worth chasing
+    MY_SHARE = 0.55        # our share needed to take an opportunity
+    ALONE_M = 150.0        # no other enemy this close
+    RANGE_M = 130.0
+    LATE_ALIVE = 3         # with this few left, duel the weakest
+
+    def __init__(self, hello):
+        self.safe = eb.Bot(hello)  # survive-first
+        self.duel = duel_bot.DuelBot(hello)
+        self.slot = number(hello.get("slot"), -1)
+        self.mode = "survive"
+        self.hold_until = -math.inf
+
+    @property
+    def arena(self):
+        return self.safe.arena
+
+    @arena.setter
+    def arena(self, value):
+        self.safe.arena = value
+        self.duel.arena = value
+
+    def load_map(self):
+        self.safe.load_map()
+        self.duel.arena = self.safe.arena
+        return True
+
+    def opportunity(self, obs, now):
+        me = obj(obs.get("self"))
+        pos = vec(me.get("pos"), 3)
+        if pos is None:
+            return False
+        share = number(me.get("hp"), 0) / max(1, number(me.get("max_hp"), 1400))
+        enemies = []
+        for e in seq(obs.get("mechs"))[:48]:
+            e = obj(e)
+            p = vec(e.get("pos"), 3)
+            if p is None or e.get("kind") != "mech" or number(e.get("id"), -1) == self.slot:
+                continue
+            hp, mx = number(e.get("hp"), 1400), max(1, number(e.get("max_hp"), 1400))
+            aim = vec(e.get("aim"), 2)
+            facing_us = aim is not None and abs(angle(bearing(p, pos) - aim[0])) < 0.6
+            enemies.append((distance(pos, p), hp / mx, facing_us))
+        if not enemies:
+            return False
+        enemies.sort()
+        d, their, facing = enemies[0]
+        others = [e for e in enemies[1:] if e[0] < self.ALONE_M]
+        alive = number(obs.get("alive"), 16)
+        if alive <= self.LATE_ALIVE and share > 0.3:
+            return d < self.RANGE_M
+        if others or d > self.RANGE_M or share < self.MY_SHARE:
+            return False
+        if their <= self.OPP_SHARE:
+            return True
+        # A distracted enemy (aiming elsewhere) that is also hurt: hit it in the back.
+        return (not facing) and their < 0.75 and share > 0.8
+
+    def act(self, obs):
+        obs = obj(obs)
+        now = number(obs.get("t"), 0)
+        errors = (ArithmeticError, LookupError, TypeError, ValueError, AttributeError)
+        try:
+            a_safe = self.safe.act(obs)
+        except errors:
+            a_safe = None
+        try:
+            a_duel = self.duel.act(obs)
+        except errors:
+            a_duel = None
+        if a_safe is None or a_duel is None:
+            return a_safe if a_duel is None else a_duel
+        if self.opportunity(obs, now):
+            self.hold_until = now + 2.0
+        self.mode = "duel" if now < self.hold_until else "survive"
+        return a_duel if self.mode == "duel" else a_safe
+
+
 class Royale:
     def __init__(self, hello):
         self.practice = duel_bot.DuelBot(hello)
-        self.ffa = eb.Bot(hello)
+        self.practice.guarded = GUARDED_OPENER
+        self.ffa = Selective(hello)
         self.detector = Detector(hello)
         self.mode = FORCE_MODE or "practice"
         self.first_ffa = None
