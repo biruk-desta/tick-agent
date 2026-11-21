@@ -13,7 +13,7 @@ What run() does for you (protocol.md section 2):
 - answers `hello` with `ready` (your class's `name`), then calls act() for each observation;
 - if observations queue up, answers only the newest one;
 - sets `tick` on your action (you don't have to);
-- bounds incoming lines and decision time, with a minimal valid action on decision failure;
+- bounds incoming lines and decision time, with map-free steering on failure;
 - exits on `end`.
 
 The types below are generated from mechfight.schema.json; they are TypedDicts, so at runtime every
@@ -37,10 +37,8 @@ except ImportError:  # Python < 3.11: only type checkers read it (annotations ar
     pass
 
 MAX_LINE = 64 * 1024
-MAX_BATCH_BYTES = 2 * MAX_LINE
-MAX_BATCH_LINES = 8
-READ_BATCH_S = 0.003
 DECISION_LIMIT_S = 0.014
+WRITE_RESERVE_S = 0.002
 INIT_LIMIT_S = 6.0
 
 # --- generated from mechfight.schema.json: do not edit ---
@@ -437,12 +435,58 @@ class ZonePhase(TypedDict):
 # --- end generated ---
 
 
-class DeadlineExceeded(Exception):
+class DeadlineExceeded(BaseException):
     pass
 
 
+_watchdog_active = False
+
+
 def _interrupt(_signum, _frame):
-    raise DeadlineExceeded
+    if _watchdog_active:
+        raise DeadlineExceeded
+
+
+def _watched(seconds, work, *args):
+    global _watchdog_active
+    try:
+        try:
+            _watchdog_active = True
+            signal.setitimer(signal.ITIMER_REAL, seconds)
+            return work(*args)
+        finally:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+            _watchdog_active = False
+    except (DeadlineExceeded, Exception):
+        _watchdog_active = False
+        return None
+
+
+def _pair(value):
+    if isinstance(value, list) and len(value) >= 2:
+        x, y = value[:2]
+        if all(type(n) in (int, float) and -1e9 <= n <= 1e9 for n in (x, y)):
+            return x, y
+    return None
+
+
+def _fallback(obs, tick):
+    me = obs.get("self")
+    zone = obs.get("zone")
+    me = me if isinstance(me, dict) else {}
+    zone = zone if isinstance(zone, dict) else {}
+    pos, center = _pair(me.get("pos")), _pair(zone.get("center"))
+    action = {"tick": tick, "move": [0.0, 0.0], "aim": _pair(me.get("aim")) or [0.0, 0.0]}
+    if pos is not None and center is not None:
+        dx, dy = center[0] - pos[0], center[1] - pos[1]
+        distance = math.hypot(dx, dy)
+        radius = zone.get("radius")
+        at_edge = type(radius) in (int, float) and 0 <= radius <= 1e9 and distance >= radius * 0.72
+        if distance and (me.get("in_zone") is False or at_edge):
+            scale = max(distance, 3.0)
+            action["move"] = [dx / scale, dy / scale]
+            action["aim"] = [math.atan2(dy, dx), 0.0]
+    return action
 
 
 def log(*args: Any) -> None:
@@ -450,45 +494,60 @@ def log(*args: Any) -> None:
     print(*args, file=sys.stderr, flush=True)
 
 
-def _send(msg: Dict[str, Any]) -> None:
-    sys.stdout.write(json.dumps(msg, separators=(",", ":"), allow_nan=False) + "\n")
-    sys.stdout.flush()
+def _encode(msg):
+    return json.dumps(msg, separators=(",", ":"), allow_nan=False).encode() + b"\n"
 
 
-def _batches(fd):
+def _send(fd, payload, deadline):
+    # Frames fit in PIPE_BUF, so the unbuffered write either flushes a whole line
+    # or leaves stdout untouched. A slow reader cannot hold up later decisions.
+    while True:
+        try:
+            os.write(fd, payload)
+            return
+        except BlockingIOError:
+            remaining = deadline - time.perf_counter()
+            if remaining <= 0 or not select.select([], [fd], [], remaining)[1]:
+                return
+        except OSError:
+            return
+
+
+def _lines(fd):
     pending = bytearray()
+    started = None
     discarding = False
     while True:
-        lines = []
-        remaining = MAX_BATCH_BYTES
-        until = None
-        while remaining:
-            chunk = os.read(fd, min(32768, remaining))
-            if not chunk:
-                break
-            if until is None:
-                until = time.perf_counter() + READ_BATCH_S
-            remaining -= len(chunk)
-            parts = chunk.split(b"\n")
-            for part in parts[:-1]:
-                if not discarding and len(pending) + len(part) <= MAX_LINE:
-                    lines.append(bytes(pending) + part)
-                pending.clear()
-                discarding = False
-            tail = parts[-1]
-            if not discarding:
-                if len(pending) + len(tail) <= MAX_LINE:
-                    pending.extend(tail)
-                else:
-                    pending.clear()
-                    discarding = True
-            if time.perf_counter() >= until or not select.select([fd], [], [], 0)[0]:
-                break
-        if lines:
-            # Keep the first line for a coalesced handshake and the newest work at the end.
-            yield lines if len(lines) <= MAX_BATCH_LINES else [lines[0], *lines[1 - MAX_BATCH_LINES:]]
+        chunk = os.read(fd, 32768)
         if not chunk:
+            yield None, None
             return
+        received = time.perf_counter()
+        parts = chunk.split(b"\n")
+        for part in parts[:-1]:
+            if not discarding and len(pending) + len(part) <= MAX_LINE:
+                yield bytes(pending) + part, started if started is not None else received
+            pending.clear()
+            started = None
+            discarding = False
+        tail = parts[-1]
+        if not discarding and tail:
+            if len(pending) + len(tail) <= MAX_LINE:
+                pending.extend(tail)
+                if started is None:
+                    started = received
+            else:
+                pending.clear()
+                discarding = True
+        if not select.select([fd], [], [], 0)[0]:
+            yield None, None
+
+
+def _decision(bot, obs, tick):
+    action = bot.act(obs)
+    if isinstance(action, dict) and action:
+        return _encode({**action, "tick": tick})
+    return None
 
 
 def run(make_bot: Any) -> None:
@@ -496,12 +555,15 @@ def run(make_bot: Any) -> None:
     # Each process runs a single match. The JSON and policy state are acyclic.
     gc.disable()
     signal.signal(signal.SIGALRM, _interrupt)
+    stdout = sys.stdout.fileno()
+    os.set_blocking(stdout, False)
+    frame_limit = os.fpathconf(stdout, "PC_PIPE_BUF")
     bot = None
     handshaken = False
     last_tick = -2
-    for batch in _batches(sys.stdin.fileno()):
-        latest = None
-        for raw in batch:
+    latest = None
+    for raw, received in _lines(sys.stdin.fileno()):
+        if raw is not None:
             try:
                 msg = json.loads(raw)
             except (ValueError, RecursionError):
@@ -511,40 +573,29 @@ def run(make_bot: Any) -> None:
             kind = msg.get("type")
             if kind == "hello" and not handshaken:
                 handshaken = True
-                try:
-                    signal.setitimer(signal.ITIMER_REAL, INIT_LIMIT_S)
-                    bot = make_bot(msg)
-                except Exception:
-                    log("Bot initialization failed. Using protocol fallback.")
-                finally:
-                    signal.setitimer(signal.ITIMER_REAL, 0)
-                _send({"type": "ready"})
+                bot = _watched(INIT_LIMIT_S, make_bot, msg)
+                if bot is None:
+                    log("Bot initialization failed. Using map-free steering.")
+                _send(stdout, b'{"type":"ready"}\n', time.perf_counter() + DECISION_LIMIT_S)
             elif kind == "obs":
-                latest = msg
+                latest = msg, received
             elif kind == "end":
                 return
+            continue
         if latest is None:
             continue
-        tick = latest.get("tick")
+        obs, received = latest
+        latest = None
+        deadline = received + DECISION_LIMIT_S
+        tick = obs.get("tick")
         if type(tick) not in (int, float) or not -1e15 <= tick <= 1e15 or not math.isfinite(tick):
             tick = last_tick + 2
         last_tick = tick
-        action = {"tick": tick}
-        if bot is not None:
-            try:
-                signal.setitimer(signal.ITIMER_REAL, DECISION_LIMIT_S)
-                action.update(bot.act(latest))
-                action["tick"] = tick
-            except DeadlineExceeded:
-                action = {"tick": tick}
-            except Exception:
-                action = {"tick": tick}
-            finally:
-                signal.setitimer(signal.ITIMER_REAL, 0)
-        try:
-            _send(action)
-        except (TypeError, ValueError):
-            _send({"tick": tick})
+        remaining = deadline - WRITE_RESERVE_S - time.perf_counter()
+        payload = _watched(remaining, _decision, bot, obs, tick) if bot is not None and remaining > 0 else None
+        if payload is None or len(payload) > frame_limit:
+            payload = _encode(_fallback(obs, tick))
+        _send(stdout, payload, deadline)
 
 
 if __name__ == "__main__":

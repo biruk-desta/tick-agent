@@ -382,6 +382,7 @@ class Zone:
     start: float
     end: float
     now: float
+    dps: float = 0.0
 
     def circle_in(self, seconds):
         remaining = self.end - max(self.now, self.start)
@@ -441,24 +442,28 @@ class Bot:
         self.mech = obj(config.get("mech"))
         self.weapon_config = obj(config.get("weapons"))
         self.cubes = obj(config.get("cubes"))
+        self.upgrade_thresholds = tuple(
+            value for raw in seq(self.cubes.get("upgrade_thresholds", (1, 3, 6, 10, 15, 21, 28, 36, 45)))
+            if (value := number(raw, 0)) > 0
+        )
         self.npc = obj(config.get("npc"))
         self.crates = obj(config.get("crates"))
         self.loot = obj(config.get("loot"))
         match = obj(config.get("match"))
         self.physics_dt = 1 / limit(number(match.get("tick_hz"), 20), 1, 1000)
         self.dt = self.physics_dt * limit(number(match.get("decide_every"), 2), 1, 20)
+        self.match_end = max(0, number(match.get("duration_s"), 480))
         self.slot = number(hello.get("slot"), 0)
         self.arena = None
         directory = obj(hello.get("map")).get("dir")
         if isinstance(directory, str) and directory and len(directory) < 2048:
-            try:
-                self.arena = Arena(directory, number(self.mech.get("height"), 9),
-                                   number(self.mech.get("step_up"), 1.2),
-                                   math.tan(math.radians(limit(number(self.mech.get("max_slope_deg"), 50), 1, 80))))
-            except (OSError, ValueError, TypeError, KeyError, AttributeError, OverflowError, RecursionError):
-                pass
+            self.arena = Arena(directory, number(self.mech.get("height"), 9),
+                               number(self.mech.get("step_up"), 1.2),
+                               math.tan(math.radians(limit(number(self.mech.get("max_slope_deg"), 50), 1, 80))))
         self.hits = {}
+        self.drop_progress = {}
         self.last_damage = self.last_sound = -math.inf
+        self.last_repair_reset = -math.inf
         self.damage_bearing = self.sound_bearing = None
         self.shelter = self.shelter_origin = None
         self.shelter_time = -math.inf
@@ -473,7 +478,10 @@ class Bot:
         self.hits = {source: t for source, t in self.hits.items() if now - t < HIT_MEMORY_S}
         for event in seq(obs.get("events"))[:40]:
             event = obj(event)
-            if event.get("type") != "damaged" or event.get("weapon") == "zone":
+            kind = event.get("type")
+            if kind in ("hit", "damaged"):
+                self.last_repair_reset = now
+            if kind != "damaged" or event.get("weapon") == "zone":
                 continue
             self.last_damage = now
             direction = number(event.get("bearing"), None)
@@ -521,6 +529,30 @@ class Bot:
     def phys(self, key, default, stats=None):
         return number(stats.get(key) if stats else None, number(self.mech.get(key), default))
 
+    def supply_hint(self, obs, pos, contacts, now):
+        previous, self.drop_progress = self.drop_progress, {}
+        known = {c.id for c in contacts}
+        own_id = number(obj(obs.get("self")).get("id"), self.slot)
+        closest, hint = LOOT_THREAT_M, None
+        for item in seq(obs.get("drops"))[:8]:
+            item = obj(item)
+            ident = number(item.get("id"), None)
+            holder = number(item.get("holder"), None)
+            progress = number(item.get("progress"), None)
+            if ident is None or holder is None or holder == own_id or progress is None or progress < 0:
+                continue
+            if number(item.get("lands_in"), math.inf) > 0:
+                continue
+            self.drop_progress[ident] = holder, progress, now
+            prior = previous.get(ident)
+            if (holder in known or prior is None or holder != prior[0] or progress <= prior[1]
+                    or not 0 < now - prior[2] <= max(0.35, self.dt * 2)):
+                continue
+            p = vec(item.get("pos"), 3)
+            if p is not None and (d := distance(pos, p)) < closest:
+                closest, hint = d, p
+        return hint
+
     def nearby_shells(self, obs, pos, velocity, height):
         hazards = []
         gravity = number(obj(self.weapon_config.get("mortar")).get("gravity"), 22)
@@ -554,13 +586,13 @@ class Bot:
                     break
         return hazards
 
-    def shelter_point(self, pos, zone, contacts, direction, radius, height, now, until):
+    def shelter_point(self, pos, zone, contacts, direction, radius, height, now, until, terminal_burn):
         arena = self.arena
         if arena is None:
             return None
         if (self.shelter_origin and now - self.shelter_time < COVER_REFRESH_S
                 and distance(pos, self.shelter_origin) < COVER_BREAK_M
-                and (self.shelter is None or zone.gap(self.shelter, 5) > 1)):
+                and (self.shelter is None or terminal_burn or zone.gap(self.shelter, 5) > 1)):
             return self.shelter
         self.shelter_origin, self.shelter_time = pos, now
         danger = [c for c in contacts if c.dist < THREAT_RANGE_M and c.kind == "mech"][:2]
@@ -576,7 +608,9 @@ class Bot:
                     return best
                 p = pos[0] + d * dx, pos[1] + d * dy
                 cell = arena.cell(*p)
-                if not arena.ground_ok(cell, radius) or arena.inset(p, radius) != p or zone.gap(p, COVER_PREDICTION_S) < min(5, zone.radius * 0.2):
+                if not arena.ground_ok(cell, radius) or arena.inset(p, radius) != p:
+                    continue
+                if not terminal_burn and zone.gap(p, COVER_PREDICTION_S) < min(5, zone.radius * 0.2):
                     continue
                 near = arena.near_cover(p)
                 if near > COVER_NEAR_M * 1.7:
@@ -599,48 +633,65 @@ class Bot:
         self.shelter = best if best_score > -14 else None
         return self.shelter
 
-    def loot_goal(self, obs, pos, zone, contacts, weapons, hp_fraction, cubes, safe, action):
-        if not safe:
-            return None
+    def loot_goal(self, obs, pos, zone, contacts, weapons, hp_fraction, cubes, safe, urgent, action):
         arena = self.arena
         options = []
         kinds = tuple(w.get("kind") for w in weapons)
         spare = next((i for i, w in enumerate(weapons) if not w), None)
         swap = next((i for i, w in enumerate(weapons) if w.get("kind") in ("mortar", "lightning")), None)
-        cube_cap = number(self.cubes.get("stat_cap"), 10)
+        detour = safe and not urgent
+        rivals = [c.pos for c in contacts if c.kind == "mech"]
         pickup_radius = limit(number(self.loot.get("pickup_radius"), 4), 0.5, 15)
+        take = None
+        if spare is not None or (detour and swap is not None):
+            for entry in seq(obs.get("pickups"))[:40]:
+                entry = obj(entry)
+                p, ident = vec(entry.get("pos"), 3), number(entry.get("id"), None)
+                kind = entry.get("kind")
+                rank = WEAPON_RANK.get(kind) if isinstance(kind, str) else None
+                if p is None or abs(pos[2] - p[2]) > 4 or ident is None or ident < 0 or rank is None or kind in kinds:
+                    continue
+                if spare is None and rank <= WEAPON_RANK[kinds[swap]]:
+                    continue
+                d = distance(pos, p)
+                if d > (WEAPON_DETOUR_M if detour else pickup_radius):
+                    continue
+                if any(distance(rival, p) < LOOT_CONTEST_M for rival in rivals):
+                    continue
+                if d <= pickup_radius:
+                    choice = (rank, -d, ident)
+                    if take is None or choice > take:
+                        take = choice
+                elif zone.gap(p, LOOT_SAFE_S) > min(3, zone.radius * 0.12):
+                    options.append((30 + rank * 4 - d, p))
+        if take is not None:
+            action["take"] = take[2]
+            if spare is None:
+                action["drop"] = swap
+            options.clear()
+        if not detour:
+            return None
+
+        cube_cap = number(self.cubes.get("stat_cap"), 10)
+        upgrade_gap = min((threshold - cubes for threshold in self.upgrade_thresholds if threshold > cubes),
+                          default=math.inf)
         own_id = number(obj(obs.get("self")).get("id"), self.slot)
-        for key, bound, maximum in (("cubes", 56, CUBE_DETOUR_M), ("pickups", 40, WEAPON_DETOUR_M), ("drops", 8, DROP_DETOUR_M)):
+        for key, bound, maximum in (("cubes", 56, CUBE_DETOUR_M), ("drops", 8, DROP_DETOUR_M)):
             for entry in seq(obs.get(key))[:bound]:
                 entry = obj(entry)
                 p = vec(entry.get("pos"), 3)
                 if p is None or abs(pos[2] - p[2]) > 4 or zone.gap(p, LOOT_SAFE_S) <= min(3, zone.radius * 0.12):
                     continue
                 d = distance(pos, p)
-                if d > maximum or any(c.kind == "mech" and distance(c.pos, p) < LOOT_CONTEST_M for c in contacts):
+                if d > maximum or any(distance(rival, p) < LOOT_CONTEST_M for rival in rivals):
                     continue
                 if key == "cubes":
-                    if cubes >= cube_cap and (d > 7 or cubes >= cube_cap + 3):
+                    if cubes >= cube_cap and (d > 7 or upgrade_gap > 3):
                         continue
                     reach = limit(number(self.cubes.get("pickup_radius"), 3.5), 0.5, 15)
                     if d < reach * 0.7:
                         continue
                     score = 51 - d
-                elif key == "pickups":
-                    kind = entry.get("kind")
-                    ident = number(entry.get("id"), None)
-                    rank = WEAPON_RANK.get(kind, 0) if isinstance(kind, str) else 0
-                    if not rank or kind in kinds or ident is None or ident < 0:
-                        continue
-                    if spare is None and (swap is None or rank <= WEAPON_RANK[kinds[swap]]):
-                        continue
-                    if d < pickup_radius * 0.96:
-                        if "take" not in action or rank > action.get("take_rank", -1):
-                            action["take"], action["take_rank"] = ident, rank
-                            if spare is None:
-                                action["drop"] = swap
-                        continue
-                    score = 30 + rank * 4 - d
                 else:
                     holder = entry.get("holder")
                     if number(entry.get("lands_in"), math.inf) > 0 or (holder is not None and holder != own_id):
@@ -652,7 +703,6 @@ class Bot:
                     if holder == own_id:
                         score += 30
                 options.append((score, p))
-        action.pop("take_rank", None)
         if not options:
             return None
         options.sort(reverse=True)
@@ -706,7 +756,8 @@ class Bot:
             return self.path[self.path_index]
         return goal
 
-    def movement(self, pos, vel, waypoint, zone, urgent, evade, threats, hazards, direction, stats, grounded, energy, now, until):
+    def movement(self, pos, vel, waypoint, zone, urgent, evade, threats, hazards, direction, stats,
+                 grounded, energy, now, until, in_zone, terminal_burn, drop_hint):
         arena = self.arena
         walk = limit(self.phys("walk_speed", 11.7, stats), 2, 60)
         boost = limit(self.phys("boost_speed", 19.5, stats), walk, 90)
@@ -718,22 +769,26 @@ class Bot:
                 self.stuck_until = now + STUCK_RETRY_S
             self.motion_origin, self.motion_time = pos, now
         stuck = now < self.stuck_until
-        core = zone.radius <= DEATH_CIRCLE_M
+        core = zone.radius <= DEATH_CIRCLE_M and not terminal_burn
         clearance = zone.gap(pos)
         sprint = energy > (JET_RESERVE if clearance < 0 else BOOST_RESERVE) and (
             (urgent and goal_distance > 12 and (clearance < 8 or zone.gap(pos, 4) < 3))
             or (evade and not core and (hazards or any(c.clear and c.dist < BOOST_THREAT_M for c in threats))))
         pace = boost if sprint and grounded else walk
-        if goal_distance < HOLD_M and not evade and not hazards:
-            if not core or goal_distance < CORE_HOLD_M:
-                return {"move": [0.0, 0.0]}
+        if core and in_zone and goal_distance < CORE_HOLD_M:
+            return {"move": [0.0, 0.0]}
+        if not core and (in_zone or terminal_burn) and goal_distance < HOLD_M and not evade and not hazards:
+            return {"move": [0.0, 0.0]}
         course = bearing(pos, waypoint)
         if goal_distance < HOLD_M and evade and threats and not core:
             course = bearing(threats[0].pos, pos)
         dx, dy = math.cos(course), math.sin(course)
         goal_scale = limit(goal_distance / (pace * 0.40), 0, 1)
         if core:
-            goal_scale = limit(goal_distance / CORE_SLOW_M, 0.03, 0.8)
+            if not in_zone and goal_distance < CORE_HOLD_M:
+                goal_scale = limit(goal_distance / (pace * self.dt), 0, 0.8)
+            else:
+                goal_scale = limit(goal_distance / CORE_SLOW_M, 0.03, 0.8)
         scale = 1.0 if (evade or hazards) and not core else goal_scale
         horizon = CORE_HORIZON_S if core else STEER_HORIZON_S
         best_score, move = -math.inf, (dx * scale, dy * scale)
@@ -754,14 +809,19 @@ class Bot:
             wall = False
             if arena is not None:
                 wall = not arena.corridor(pos, endpoint, radius, height)
-            gap = zone.gap(endpoint, 0.8)
-            score = (distance(pos, waypoint) - distance(endpoint, waypoint)) * (3.1 if urgent else 1.35)
-            score -= max(0, min(9, zone.radius * 0.25) - gap) * (4.2 if core else 2.6)
+            progress = goal_distance - distance(endpoint, waypoint)
+            score = progress * (3.1 if urgent else 1.35)
+            if not terminal_burn:
+                gap = zone.gap(endpoint, 0.8)
+                score -= max(0, min(9, zone.radius * 0.25) - gap) * (4.2 if core else 2.6)
             score -= abs(offset) * 0.38
             if wall:
                 score -= 76
             if arena is not None and not core and not wall:
                 score += max(0, 12 - abs(arena.near_cover(endpoint) - (radius + 6))) * 0.23
+                if drop_hint is not None and progress > 0:
+                    if not arena.clear_ray(raised(drop_hint, 7), raised(endpoint, height * 0.65)):
+                        score += 2
             for c in threats[:3]:
                 delta = distance(endpoint, c.pos) - distance(pos, c.pos)
                 score += delta * (0.8 if c.dist < 36 else 0.45)
@@ -794,30 +854,39 @@ class Bot:
                 jet = True
         return {"move": list(move), "boost": (sprint and grounded and not jump) or jet, "jump": jump}
 
-    def target(self, obs, pos, contacts, fraction, zone, urgent, safe):
+    def target(self, obs, pos, contacts, fraction, zone, urgent, safe, terminal_burn, repairing, incoming):
         targets = []
         alive = number(obs.get("alive"), 16)
+        duel = alive == 2
+        quiet = (not urgent and not incoming and zone.now - self.last_damage >= HIT_MEMORY_S
+                 and (duel or zone.now - self.last_sound >= SOUND_MEMORY_S))
+        nearby_rivals = {c.id for c in contacts if c.kind == "mech" and c.clear and c.dist < LOOT_THREAT_M}
+        front_half_arc = math.radians(limit(self.phys("front_arc_deg", 180), 0, 360)) / 2
         for c in contacts:
             if not c.clear or c.hp <= 0:
                 continue
             weak = c.hp < min(c.max_hp * WEAK_FRACTION, 430)
-            rear = c.aim is not None and c.face_error > math.pi / 2
+            rear = c.aim is not None and c.face_error > front_half_arc
             if c.kind == "npc":
                 allowed = c.attacker and c.dist < 58 and (not urgent or c.dist < 27)
-                allowed |= safe and c.dist < 62 and (weak or (fraction > 0.88 and c.dist > 35))
+                allowed |= safe and not repairing and c.dist < 62 and (weak or (fraction > 0.88 and c.dist > 35))
                 merit = 26 + 35 * c.attacker + 22 * weak
             else:
                 active = c.face_error < 0.45 and c.dist < (105 if c.charging else 46)
-                finishing = fraction > HEAL_FRACTION and not urgent and weak and c.dist < (112 if rear else 68)
-                busy = rear and c.charging and c.dist < 64 and fraction > 0.84 and not urgent
-                endgame = alive <= 3 and zone.radius < 31 and c.dist < 36
-                allowed = c.attacker or active or finishing or busy or endgame
-                if fraction < HEAL_FRACTION and not (c.attacker or active or endgame or c.hp < 115):
+                finishing = (fraction > HEAL_FRACTION and not urgent and weak and c.dist < (112 if rear else 68)
+                             and (not repairing or c.hp <= 115))
+                busy = rear and c.charging and c.dist < 64 and fraction > 0.84 and not urgent and not repairing
+                endgame = (duel and terminal_burn) or (alive <= 3 and zone.radius < 31 and c.dist < 36)
+                opportunity = (quiet and nearby_rivals.issubset((c.id,))
+                               and (duel or (rear and c.dist < 112))
+                               and (not repairing or (duel and rear)))
+                allowed = c.attacker or active or finishing or busy or endgame or opportunity
+                if fraction < HEAL_FRACTION and not (c.attacker or active or endgame or opportunity and duel or c.hp < 115):
                     allowed = False
                 merit = 48 + 55 * c.attacker + 40 * active + 25 * weak + 14 * rear + 19 * endgame
             if allowed:
                 targets.append((merit - c.dist * 0.26 + 8 * (c.id == self.last_fire_target), c))
-        if safe and not urgent and fraction > HEAL_FRACTION:
+        if safe and not urgent and not repairing and fraction > HEAL_FRACTION:
             for item in seq(obs.get("crates"))[:36]:
                 item = obj(item)
                 p, ident = vec(item.get("pos"), 3), number(item.get("id"), None)
@@ -895,16 +964,18 @@ class Bot:
         vertical = math.atan2(max(0.70, height * 0.37), max(1.0, horizontal))
         return yaw, limit(pitch, *pitch_bounds), tolerance, vertical
 
-    def combat(self, obs, pos, weapons, actual, stats, contacts, safe, urgent, evade, energy, fraction, zone, action, until):
+    def combat(self, obs, pos, weapons, actual, stats, contacts, safe, urgent, evade, energy, fraction, zone,
+               action, until, terminal_burn, repairing, incoming):
         muzzle = self.phys("muzzle_height", 7, stats)
         pitch_bounds = self.phys("min_pitch", -0.7, stats), self.phys("max_pitch", 1.3, stats)
         firing = [False, False]
         action["fire"] = firing
         selected = None
         best = -math.inf
-        evacuating = (urgent and (zone.radius > DEATH_CIRCLE_M or math.hypot(*action["move"]) > 0.35)
-                      or action.get("boost") or (evade and fraction < HEAL_FRACTION))
-        targets = self.target(obs, pos, contacts, fraction, zone, urgent, safe)
+        evacuating = (not terminal_burn and
+                      (urgent and (zone.radius > DEATH_CIRCLE_M or math.hypot(*action["move"]) > 0.35)
+                       or action.get("boost") or (evade and fraction < HEAL_FRACTION)))
+        targets = self.target(obs, pos, contacts, fraction, zone, urgent, safe, terminal_burn, repairing, incoming)
         for merit, target in targets:
             for i, weapon in enumerate(weapons):
                 if time.perf_counter() >= until:
@@ -1009,7 +1080,8 @@ class Bot:
         height = limit(self.phys("height", 9, stats), 1, 80)
         eye = limit(self.phys("eye_height", 8, stats), 1, 80)
         walk = limit(self.phys("walk_speed", 11.7, stats), 2, 60)
-        fraction = limit(number(me.get("hp"), 1400) / max(1, number(me.get("max_hp"), 1400)), 0, 1)
+        hp = max(0, number(me.get("hp"), 1400))
+        fraction = limit(hp / max(1, number(me.get("max_hp"), 1400)), 0, 1)
         energy = limit(number(me.get("energy"), 0), 0, 1000)
         grounded = me.get("grounded") is not False
         cubes = limit(number(me.get("cubes")), 0, 100)
@@ -1017,10 +1089,32 @@ class Bot:
         size = limit(number(zone_obs.get("radius"), 560), 0, 2000)
         zone = Zone(center, size, vec(zone_obs.get("next_center"), 2) or center,
                     limit(number(zone_obs.get("next_radius"), size), 0, size),
-                    number(zone_obs.get("shrink_start"), now), number(zone_obs.get("shrink_end"), now + 99), now)
+                    number(zone_obs.get("shrink_start"), now), number(zone_obs.get("shrink_end"), now + 99), now,
+                    max(0, number(zone_obs.get("dps"))))
         goal, urgent = zone.anchor(pos, walk)
+        gap = zone.gap(pos)
+        in_zone = me.get("in_zone")
+        if not isinstance(in_zone, bool):
+            in_zone = gap >= 0
+        terminal_burn = False
+        if not in_zone:
+            if zone.next_radius == 0 and zone.dps > 0:
+                # Even straight-line travel to the current edge is too slow in this case.
+                # A collapsed center at the reported position can still be unsafe due to rounding.
+                pace = limit(self.phys("boost_speed", 19.5, stats), walk, 90)
+                survival = min(hp / zone.dps, max(0, self.match_end - now))
+                terminal_burn = (-gap > pace * survival
+                                 or (zone.radius == 0 and distance(pos, center) < 1e-6))
+            if terminal_burn:
+                goal, urgent = pos[:2], False
+            elif not urgent:
+                goal, urgent = center, True
         self.remember(obs, now)
+        repair_wait = max(0, self.phys("regen_delay", 5, stats) - (now - self.last_repair_reset))
+        repairing = (in_zone and fraction < 1 and self.phys("regen_per_s", 45, stats) > 0
+                     and now + repair_wait < self.match_end)
         contacts = self.contacts(obs, pos, eye)
+        drop_hint = self.supply_hint(obs, pos, contacts, now) if self.arena is not None else None
         threats = [c for c in contacts if (c.kind == "mech" and c.dist < THREAT_RANGE_M) or c.attacker]
         hostile = any(c.clear and (c.attacker or (c.dist < EVADE_RANGE_M and c.kind == "mech")) for c in threats)
         just_hit = now - self.last_damage < HIT_MEMORY_S
@@ -1028,19 +1122,23 @@ class Bot:
         direction = self.damage_bearing if just_hit else self.sound_bearing if heard else None
         hazards = self.nearby_shells(obs, pos, velocity, height)
         evade = hostile or just_hit or bool(hazards)
-        safe = not (evade or heard or any(c.kind == "mech" and c.clear and c.dist < LOOT_THREAT_M for c in contacts))
+        safe = not (terminal_burn or evade or heard
+                    or any(c.kind == "mech" and c.clear and c.dist < LOOT_THREAT_M for c in contacts))
         items = seq(me.get("weapons"))
         weapons = [obj(items[i]) if i < len(items) else {} for i in range(2)]
         moving_to_evade = evade
 
         if self.arena is not None:
             goal = self.arena.inset(goal, radius + 0.4)
+        pickup = self.loot_goal(obs, pos, zone, contacts, weapons, fraction, cubes, safe, urgent, action)
+        if not in_zone or not safe or threats or pickup is not None or (urgent and gap < walk):
+            drop_hint = None
         if not urgent:
-            pickup = self.loot_goal(obs, pos, zone, contacts, weapons, fraction, cubes, safe, action)
             if pickup is not None:
                 goal = pickup
             elif time.perf_counter() < until:
-                cover = self.shelter_point(pos, zone, contacts, direction, radius, height, now, min(until, begin + 0.0029))
+                cover = self.shelter_point(pos, zone, contacts, direction, radius, height, now,
+                                           min(until, begin + 0.0029), terminal_burn)
                 if cover is not None:
                     goal = cover
                     if distance(pos, cover) < HOLD_M and not hostile and not hazards:
@@ -1048,9 +1146,9 @@ class Bot:
                 elif evade:
                     away = bearing(threats[0].pos, pos) if threats else angle((direction if direction is not None else actual[0]) + math.pi)
                     p = pos[0] + COVER_AWAY_M * math.cos(away), pos[1] + COVER_AWAY_M * math.sin(away)
-                    if zone.gap(p, 4) > 2:
+                    if terminal_burn or zone.gap(p, 4) > 2:
                         goal = p
-                elif self.arena is None or self.arena.near_cover(pos) > COVER_NEAR_M * 1.7:
+                elif not terminal_burn and (self.arena is None or self.arena.near_cover(pos) > COVER_NEAR_M * 1.7):
                     p = zone.next_center
                     if distance(pos, p) < 12:
                         p = (pos[0] + 22 * math.cos(self.scout_yaw), pos[1] + 22 * math.sin(self.scout_yaw))
@@ -1060,7 +1158,8 @@ class Bot:
         waypoint = self.route(pos, goal, zone, radius, height, now < self.stuck_until,
                               min(until, time.perf_counter() + ROUTE_SLICE_S))
         action.update(self.movement(pos, velocity, waypoint, zone, urgent, moving_to_evade, threats, hazards, direction,
-                                    stats, grounded, energy, now, min(until, time.perf_counter() + 0.0020)))
+                                    stats, grounded, energy, now, min(until, time.perf_counter() + 0.0020),
+                                    in_zone, terminal_burn, drop_hint))
         if threats and (evade or threats[0].clear):
             direction = bearing(pos, threats[0].pos)
         if direction is None:
@@ -1070,7 +1169,8 @@ class Bot:
                 direction = angle(self.scout_yaw + now * SCAN_RATE)
         action["aim"] = [direction, 0.0]
         if time.perf_counter() < until:
-            self.combat(obs, pos, weapons, actual, stats, contacts, safe, urgent, evade, energy, fraction, zone, action, until)
+            self.combat(obs, pos, weapons, actual, stats, contacts, safe, urgent, evade, energy, fraction, zone,
+                        action, until, terminal_burn, repairing, bool(hazards))
         return action
 
 
