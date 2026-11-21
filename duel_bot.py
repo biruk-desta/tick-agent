@@ -509,7 +509,7 @@ class DuelBot(Bot):
             for item in seq(obs.get("pickups"))[:40]:
                 item = obj(item)
                 p, kind = vec(item.get("pos"), 3), item.get("kind")
-                if p is None or kind not in weights or kind in kinds or abs(p[2] - pos[2]) > 5:
+                if p is None or not isinstance(kind, str) or kind not in weights or kind in kinds or abs(p[2] - pos[2]) > 5:
                     continue
                 if not empty and kind != "lightning":
                     continue
