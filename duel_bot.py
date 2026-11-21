@@ -36,6 +36,18 @@ class _Ranks(dict):
 DUEL_WEAPON_RANK = _Ranks({"gun": 0, "mortar": -1, "lightning": 2, "laser": 3})
 FIRST_WEAPON_DETOUR_M = 160.0   # walk this far for a first laser or lightning
 LASER_DETOUR_M = 90.0           # and this far to add a laser
+# These three switches affect only the guarded practice instance in royale.py.
+# The unguarded DuelBot used by Selective's error fallback retains its old policy.
+PRACTICE_FOCUS_COMMIT = False
+PRACTICE_RANGE_DISCIPLINE = False
+PRACTICE_FIRE_CYCLE = False
+PRACTICE_PLAN_S = 0.008
+FOCUS_SWITCH_MARGIN = 32.0
+FOCUS_BLOCKED_S = 0.6
+FINISH_HP_SHARE = 0.30
+FINISH_OWN_SHARE = 0.55
+FINISH_MAX_CROWD = 2
+LETHAL_DAMAGE_FACTOR = 0.70  # conservative estimate; no rear/cook-off/cube bonus
 LASER_RANGE_M = 110.0
 REPAIR_TO = 0.85                # heal to this share before hunting the next one
 VEL_SMOOTH = 0.35          # weight of the newest velocity sample in the per-target average
@@ -64,6 +76,13 @@ class DuelBot(Bot):
         self.last_seen = {}        # mech id -> (time, pos)
         self.kill_spot = None      # (time, pos) where a victim died
         self.hunt_point = None     # (time, pos) best guess of where a hunter is
+        self.focus_id = None
+        self.focus_blocked_at = None
+        self.practice_foe = None
+        self.practice_crowd = 0
+        self.practice_weapons = ()
+        self.practice_energy = 0.0
+        self.practice_finish = False
 
     # ------------------------------------------------------------------ targets
     def track(self, contacts):
@@ -82,10 +101,14 @@ class DuelBot(Bot):
                        c.clear, c.attacker, c.charging, c.armed)
 
     def target(self, obs, pos, contacts, fraction, zone, must_move, safe, terminal_burn, repairing, incoming):
+        if self.guarded and PRACTICE_FOCUS_COMMIT and self.practice_foe is not None:
+            return [(200.0, self.lead_contact(self.practice_foe))]
         targets = []
         farming_ok = self.hp_share >= 0.85
         mechs = [c for c in contacts if c.kind == "mech"]
         for c in contacts:
+            if c.kind == "mech" and self.guarded and PRACTICE_FOCUS_COMMIT:
+                continue  # No selected movement focus: do not open a different duel.
             if c.kind == "mech" and self.guarded and not self.engaging_us(c, pos):
                 continue
             if c.kind == "mech":
@@ -126,6 +149,8 @@ class DuelBot(Bot):
 
     # ----------------------------------------------------------------- movement
     def desired_range(self, kinds, foe):
+        if self.guarded and PRACTICE_RANGE_DISCIPLINE:
+            return self.practice_range(kinds, foe)
         theirs = {k for k in foe.armed if k in KNOWN_WEAPONS}
         if "lightning" in kinds:
             r = 26.0
@@ -200,7 +225,8 @@ class DuelBot(Bot):
 
     def duel_act(self, obs):
         begin = time.perf_counter()
-        until = begin + eb.PLAN_BUDGET_S
+        active = self.guarded and (PRACTICE_FOCUS_COMMIT or PRACTICE_RANGE_DISCIPLINE or PRACTICE_FIRE_CYCLE)
+        until = begin + (min(eb.PLAN_BUDGET_S, PRACTICE_PLAN_S) if active else eb.PLAN_BUDGET_S)
         obs = obj(obs)
         me = obj(obs.get("self"))
         zone_obs = obj(obs.get("zone"))
@@ -280,6 +306,23 @@ class DuelBot(Bot):
                 share = c.hp / c.max_hp if math.isfinite(c.hp) else 1.0
                 return share * 120 + c.dist * 0.5 - (40 if c.clear else 0) - (25 if c.attacker else 0)
             foe = min(hunters, key=foe_key)
+        if active:
+            if PRACTICE_FOCUS_COMMIT:
+                foe = self.choose_focus(mechs, now)
+            self.practice_foe = foe
+            if PRACTICE_RANGE_DISCIPLINE:
+                self.practice_weapons, self.practice_energy = weapons, energy
+                # Count all reported living mechs, not only the eight contact candidates.
+                nearby = {number(obj(e).get("id"), -1) for e in seq(obs.get("mechs"))[:48]
+                          if obj(e).get("kind") == "mech" and number(obj(e).get("hp"), 1) > 0
+                          and (p := vec(obj(e).get("pos"), 3)) is not None and distance(pos, p) < 180}
+                nearby.update(i for i in self.hits if 0 <= i < 16 and i != self.slot)
+                nearby.discard(self.slot)
+                self.practice_crowd = len(nearby)
+                self.practice_finish = bool(foe and foe.clear and math.isfinite(foe.hp)
+                    and foe.hp <= foe.max_hp * FINISH_HP_SHARE and fraction >= FINISH_OWN_SHARE
+                    and self.practice_crowd <= FINISH_MAX_CROWD and foe.dist <= 130
+                    and self.ready_delay(foe) <= 0.3)
         foe_share = (foe.hp / foe.max_hp) if foe is not None and math.isfinite(foe.hp) else 1.0
 
         # Retreat to repair when losing badly and the foe is not nearly dead.
@@ -298,7 +341,7 @@ class DuelBot(Bot):
             self.mode = "duel"
             move, boost = self.engage_move(pos, foe, kinds, zone, now, radius, height, energy, fraction, hunters)
             cube = self.cube_goal(obs, pos, zone, FIGHT_CUBE_M) if fraction > RETREAT_FRACTION else None
-            if cube is not None:
+            if cube is not None and not (self.guarded and PRACTICE_RANGE_DISCIPLINE and self.practice_finish):
                 # Kill cubes heal and add damage: walk onto them mid-fight, still aiming at the foe.
                 self.mode = "duel-cube"
                 c = bearing(pos, cube)
@@ -410,6 +453,162 @@ class DuelBot(Bot):
             charging = any(f and w.get("kind") == "laser" for f, w in zip(action.get("fire", ()), weapons))
             action["boost"] = bool(boosting) and not charging
         return action
+
+    def setting(self, weapon, key, default):
+        return number(obj(weapon.get("stats")).get(key),
+                      number(obj(self.weapon_config.get(weapon.get("kind"))).get(key), default))
+
+    def ready_delay(self, foe):
+        waits = []
+        for w in self.practice_weapons:
+            kind = w.get("kind")
+            wait = max(0, number(w.get("cooldown")))
+            if kind == "gun":
+                reload = number(w.get("reload"))
+                if number(w.get("ammo"), 0) <= 0 and reload <= 0:
+                    reload = self.setting(w, "reload", 2.4)
+                wait = max(wait, reload)
+            elif kind == "laser":
+                wait += max(0, self.setting(w, "charge", 0.75) - number(w.get("charge")))
+            elif kind == "lightning":
+                if foe.dist > self.setting(w, "range", 45) * 0.9 or self.practice_energy < 18:
+                    continue
+            else:
+                continue
+            waits.append(wait)
+        return min(waits, default=math.inf)
+
+    def choose_focus(self, mechs, now):
+        candidates = [c for c in mechs if c.hp > 0 and c.dist <= (210 if c.id == self.focus_id or c.attacker else 170)]
+        current = next((c for c in candidates if c.id == self.focus_id), None)
+        if current is None or current.clear:
+            self.focus_blocked_at = None
+        elif self.focus_blocked_at is None:
+            self.focus_blocked_at = now
+        expired = self.focus_blocked_at is not None and now - self.focus_blocked_at >= FOCUS_BLOCKED_S
+        if not candidates:
+            self.focus_id = None
+            return None
+        def cost(c):
+            health = c.hp if math.isfinite(c.hp) else c.max_hp
+            return 0.09 * health + 0.45 * c.dist + (0 if c.clear else 55) - 18 * c.attacker
+        best = min(candidates, key=lambda c: (cost(c), c.id))
+        if current is not None and not expired:
+            if cost(current) <= cost(best) + FOCUS_SWITCH_MARGIN:
+                best = current
+        if expired:
+            clear = [c for c in candidates if c.clear]
+            if clear:
+                best = min(clear, key=lambda c: (cost(c), c.id))
+        if best.id != self.focus_id:
+            self.focus_blocked_at = None if best.clear else now
+        self.focus_id = best.id
+        return best
+
+    def practice_range(self, kinds, foe):
+        arc = next((w for w in self.practice_weapons if w.get("kind") == "lightning"), None)
+        usable_arc = arc is not None and self.practice_energy >= max(18, 3 * self.setting(arc, "energy", 3))
+        want = 26.0 if usable_arc else LASER_RANGE_M if "laser" in kinds else GUN_RANGE_M
+        floor = 0.0
+        if "lightning" in foe.armed and not usable_arc:
+            floor = number(obj(self.weapon_config.get("lightning")).get("range"), 45) * 1.4
+        if "mortar" in foe.armed and usable_arc:
+            want = 22.0
+        if self.practice_finish:
+            # Close modestly only while healthy, ready, and not surrounded.
+            want = min(want, max(45.0, foe.dist - 12.0))
+        return max(floor, want)
+
+    def charge_damage(self, weapon):
+        full = max(0.05, self.setting(weapon, "charge", 0.75))
+        part = limit(self.setting(weapon, "min_frac", 0.35), 0, 1)
+        return self.setting(weapon, "damage", 315) * (part + (1 - part) *
+            limit(number(weapon.get("charge")) / full, 0, 1)) * LETHAL_DAMAGE_FACTOR
+
+    def combat(self, obs, pos, weapons, actual, stats, contacts, safe, must_move, evade, energy, fraction, zone,
+               action, until, terminal_burn, repairing, incoming):
+        if not (self.guarded and PRACTICE_FIRE_CYCLE):
+            return super().combat(obs, pos, weapons, actual, stats, contacts, safe, must_move, evade, energy,
+                                  fraction, zone, action, until, terminal_burn, repairing, incoming)
+        fire = action["fire"] = [False, False]
+        targets = self.target(obs, pos, contacts, fraction, zone, must_move, safe, terminal_burn, repairing, incoming)
+        escaping = must_move or incoming or self.mode == "retreat"
+        muzzle = self.phys("muzzle_height", 7, stats)
+        bounds = self.phys("min_pitch", -0.7, stats), self.phys("max_pitch", 1.3, stats)
+        velocity = vec(obj(obs.get("self")).get("vel"), 3) or ZERO
+        base = tuple(p + v * self.physics_dt for p, v in zip(pos, velocity))
+        selected = None
+        for _, target in targets[:4]:
+            plans = []
+            for i, w in enumerate(weapons[:2]):
+                if time.perf_counter() >= until:
+                    break
+                kind = w.get("kind")
+                if kind not in KNOWN_WEAPONS:
+                    continue
+                charge = number(w.get("charge"))
+                if kind == "gun" and (number(w.get("reload")) > 0 or number(w.get("ammo"), 0) <= 0):
+                    continue
+                if kind == "lightning" and energy < max(18, self.setting(w, "energy", 3)):
+                    continue
+                if kind == "laser" and escaping and charge <= 0:
+                    continue
+                plan = self.aim_for(w, target, base, muzzle, bounds)
+                if plan is None:
+                    continue
+                cooldown = max(0, number(w.get("cooldown")))
+                rank = {"gun": 12, "laser": 26, "lightning": 28, "mortar": 20}[kind] - 60 * cooldown
+                if charge > 0:
+                    full = max(0.05, self.setting(w, "charge", 0.75))
+                    turn = abs(angle(plan[0] - actual[0])) / max(0.1, self.phys("turn_rate", 4, stats))
+                    turn = max(turn, abs(plan[1] - actual[1]) / max(0.1, self.phys("pitch_rate", 3, stats)))
+                    lethal = math.isfinite(target.hp) and target.hp <= self.charge_damage(w)
+                    # Use gun lead early in a charge; reserve time to aim the release.
+                    release_due = lethal or full - charge <= turn + 2 * self.dt
+                    rank += 100 if release_due else -30
+                elif kind == "gun" and math.isfinite(target.hp) and target.hp <= self.setting(w, "damage", 45) * LETHAL_DAMAGE_FACTOR:
+                    rank += 40
+                plans.append((rank, i, plan))
+            if plans:
+                selected = target, plans
+                break
+        self.last_fire_target = None
+        if selected is not None:
+            target, plans = selected
+            _, chosen, main = max(plans, key=lambda item: (item[0], -item[1]))
+            action["aim"] = list(main[:2])
+            self.last_fire_target = target.id
+            for _, i, plan in plans:
+                w, kind = weapons[i], weapons[i]["kind"]
+                yaw, pitch, width, vertical = plan
+                # Both the current and commanded torso angles must support this shot.
+                aligned = (abs(angle(yaw - actual[0])) <= width
+                    and abs(angle(yaw - main[0])) <= width
+                    and (kind == "lightning" or (abs(pitch - actual[1]) <= vertical
+                         and abs(pitch - main[1]) <= vertical)))
+                ready = number(w.get("cooldown")) <= self.dt + 1e-9
+                if kind == "laser":
+                    charge = number(w.get("charge"))
+                    full = max(0.05, self.setting(w, "charge", 0.75))
+                    minimum = max(0, self.setting(w, "min_charge", 0.15))
+                    lethal = math.isfinite(target.hp) and target.hp <= self.charge_damage(w)
+                    if charge > 0:
+                        fire[i] = not (escaping or (aligned and charge >= minimum
+                            and (charge >= full or lethal)))
+                    elif chosen == i and ready and not escaping:
+                        turn_window = min(0.8, max(0, self.phys("turn_rate", 4, stats)) * full * 0.5)
+                        pitch_window = min(0.6, max(0, self.phys("pitch_rate", 3, stats)) * full * 0.5)
+                        fire[i] = (abs(angle(yaw - actual[0])) <= turn_window
+                                   and abs(pitch - actual[1]) <= pitch_window)
+                elif ready and aligned:
+                    fire[i] = True
+        # Releasing an unusable charge restores speed; it may expend a beam into cover.
+        for i, w in enumerate(weapons[:2]):
+            if w.get("kind") == "gun" and not fire[i] and number(w.get("reload")) <= 0:
+                ammo = number(w.get("ammo"), 0)
+                if ammo <= 0 or (selected is None and not self.practice_foe
+                                and ammo <= self.setting(w, "mag", 12) * eb.RELOAD_FRACTION):
+                    action["reload"] = True
 
     def cube_goal(self, obs, pos, zone, reach=140.0):
         best, goal = math.inf, None
