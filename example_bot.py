@@ -1,10 +1,11 @@
-"""Survival policy for the mechfight/1 starter entry point."""
+"""Practice and free-for-all policies for mechfight/1."""
 from array import array
 from dataclasses import dataclass
 import heapq
 import json
 import math
 import os
+import random
 import stat
 import time
 
@@ -12,6 +13,7 @@ import mechfight as mf
 
 
 # Policy settings. Live physics and weapon values are read from hello and observations.
+PLAY_MODE = "practice"  # Set to "free-for-all" to use the survive-first policy.
 PLAN_BUDGET_S = 0.006
 ROUTE_SLICE_S = 0.0015
 ROUTE_NODES_PER_TICK = 280
@@ -124,6 +126,31 @@ def distance(a, b):
 
 def raised(pos, height):
     return pos[0], pos[1], pos[2] + height
+
+
+def accelerate(velocity, desired, change):
+    dx, dy = desired[0] - velocity[0], desired[1] - velocity[1]
+    step = min(1, change / max(1e-6, math.hypot(dx, dy)))
+    return velocity[0] + dx * step, velocity[1] + dy * step
+
+
+def intercept(origin, target, velocity, delay, speed, barrel, gravity=0):
+    """Find the low shot: muzzle offset + flight distance meets the moving aim point."""
+    position = tuple(p + v * delay - o for p, v, o in zip(target, velocity, origin))
+    if speed == 0:  # Hitscan.
+        return position, 0.0
+    x, y, z = position
+    vx, vy, vz = velocity
+    flight = max(0.0, (math.hypot(x, y, z) - barrel) / speed)
+    for _ in range(20 if gravity else 9):
+        if flight > 4.5:
+            return None
+        ray = x + vx * flight, y + vy * flight, z + vz * flight + gravity * flight**2 * 0.5
+        updated = max(0.0, (math.hypot(*ray) - barrel) / speed)
+        if abs(updated - flight) * speed < 0.025:
+            return ray, flight
+        flight = updated
+    return None
 
 
 def read_map_file(path):
@@ -1200,5 +1227,622 @@ class Bot:
         return action
 
 
+@dataclass(slots=True)
+class Pilot:
+    pos: tuple
+    vel: tuple
+    aim: tuple
+    stats: dict
+    weapons: list
+    hp: float
+    fraction: float
+    energy: float
+    grounded: bool
+    radius: float
+    height: float
+    walk: float
+    boost: float
+
+
+class PracticeBot(Bot):
+    def __init__(self, hello):
+        super().__init__(hello)
+        seed = hello.get("seed")
+        self.rng = random.Random(seed if type(seed) in (int, float) and -2**53 <= seed <= 2**53 else self.slot)
+        self.pursuers = {}
+        self.locations = {}
+        self.kill_sites = {}
+        self.hunter_count = 0
+        self.duel_target = None
+        self.stride_until = -math.inf
+        self.strafe = 1
+        self.stride = 1.0
+        self.sprint = False
+        self.repairing = False
+        self.peek = None
+        self.cover_key, self.cover_until, self.cover = None, -math.inf, None
+        self.search_sound, self.search_sound_time = None, -math.inf
+        self.phase = "search"
+
+    def setting(self, weapon, key, default):
+        defaults = obj(self.weapon_config.get(weapon.get("kind")))
+        return number(obj(weapon.get("stats")).get(key), number(defaults.get(key), default))
+
+    def pilot(self, me, pos):
+        stats = obj(me.get("stats"))
+        walk = limit(self.phys("walk_speed", 11.7, stats), 2, 60)
+        items = seq(me.get("weapons"))
+        weapons = [obj(items[i]) if i < len(items) else {} for i in range(2)]
+        hp = max(0, number(me.get("hp"), 1400))
+        return Pilot(pos, vec(me.get("vel"), 3) or ZERO, vec(me.get("aim"), 2) or (0, 0), stats, weapons,
+                     hp, limit(hp / max(1, number(me.get("max_hp"), 1400)), 0, 1),
+                     limit(number(me.get("energy")), 0, 1000), me.get("grounded") is not False,
+                     limit(self.phys("radius", 2.5, stats), 0.5, 25), limit(self.phys("height", 9, stats), 1, 80),
+                     walk, limit(self.phys("boost_speed", 19.5, stats), walk, 90))
+
+    def practice_contacts(self, obs, p, contacts, now):
+        rivals = [c for c in contacts if c.kind == "mech" and 0 <= c.id < 16 and c.hp > 0]
+        self.pursuers = {ident: t for ident, t in self.pursuers.items() if now - t <= 4}
+        self.pursuers.update({ident: when for ident, when in self.hits.items() if 0 <= ident < 16})
+        self.kill_sites = {ident: site for ident, site in self.kill_sites.items() if now < site[1]}
+        for c in rivals:
+            self.locations[c.id] = (c.pos, now)
+            toward = bearing(c.pos, p.pos)
+            closing = c.vel[0] * math.cos(toward) + c.vel[1] * math.sin(toward)
+            if c.attacker or (c.dist < 180 and closing > 3 and (c.aim is None or c.face_error < 0.75)):
+                self.pursuers[c.id] = now
+        for beam in seq(obs.get("beams"))[:16]:
+            ident = number(obj(beam).get("by"), None)
+            if ident is not None and 0 <= ident < 16 and any(c.id == ident and c.face_error < 0.65 for c in rivals):
+                self.pursuers[ident] = now
+        for event in seq(obs.get("events"))[:40]:
+            event = obj(event)
+            ident = number(event.get("target"), None)
+            if event.get("type") == "kill" and ident is not None:
+                self.pursuers.pop(ident, None)
+                location = self.locations.pop(ident, None)
+                if location and now - location[1] < 6:
+                    self.kill_sites[ident] = location[0], now + 18
+        self.locations = {ident: site for ident, site in self.locations.items() if now - site[1] < 6}
+        self.hunter_count = len(self.pursuers)
+        return rivals
+
+    def heard_goal(self, obs, pos, now):
+        for item in seq(obs.get("sounds"))[:40]:
+            item = obj(item)
+            band, kind = item.get("dist"), item.get("kind")
+            yaw = number(item.get("bearing"), None)
+            heard = now - max(0, number(item.get("age")))
+            if (yaw is None or heard <= self.search_sound_time or band not in ("near", "mid")
+                    or kind not in ("step", "boost", "gun", "mortar", "laser", "laser_charge", "lightning")):
+                continue
+            if band == "mid" and kind in ("step", "boost"):
+                continue
+            reach = 51 if band == "near" else 106
+            self.search_sound = pos[0] + reach * math.cos(yaw), pos[1] + reach * math.sin(yaw)
+            self.search_sound_time = heard
+        return self.search_sound if now - self.search_sound_time < 2.3 else None
+
+    def target_merit(self, target):
+        hp = target.hp if math.isfinite(target.hp) else target.max_hp
+        rear = target.aim is not None and target.face_error > math.radians(self.phys("front_arc_deg", 180)) / 2
+        if rear:
+            hp /= limit(self.phys("rear_mult", 1.5), 1, 6)
+        side = target.aim is not None and target.face_error > 1.03
+        return (120 - min(2400, hp) * 0.050 - target.dist * 0.23 + 8 * side + 12 * target.clear
+                + 12 * (target.id in self.pursuers) + 6 * (target.id == self.last_fire_target))
+
+    def range_band(self, p, target):
+        kinds = tuple(w.get("kind") for w in p.weapons)
+        arc = next((w for w in p.weapons if w.get("kind") == "lightning"), None)
+        if arc and p.energy > 16 and "mortar" not in target.armed:
+            reach = self.setting(arc, "range", 45)
+            if "laser" in target.armed or "laser" not in kinds or target.dist < reach:
+                return reach * 0.59, reach * 0.86
+        if "lightning" in target.armed:
+            reach = number(obj(self.weapon_config.get("lightning")).get("range"), 45)
+            return reach * 1.42, reach * (2.23 if "laser" in kinds else 1.92)
+        if "mortar" in target.armed:
+            return (80, 112) if "laser" in kinds else (28, 49)
+        if "mortar" in kinds and "laser" not in kinds:
+            return 29, 52
+        return (61, 104) if "laser" in kinds else (47, 75)
+
+    def upgrade(self, offer, p, zone):
+        kinds = [w.get("kind") for w in p.weapons]
+        # Estimate impact on the next duel. A specialized weapon gets most of its value
+        # when we can actually field it; gun upgrades still help fill the other cooldown.
+        gun_share = 1.0 if all(k in (None, "gun") for k in kinds) else 0.55
+        weights = {"plating": 15, "armor": 9, "nanites": 8 + 12 * (1 - p.fraction),
+                   "servos": 7, "gyros": 6, "reactor": 5, "jets": 4, "capacitor": 3,
+                   "gun_damage": 15 * gun_share, "gun_mag": 29 * gun_share, "gun_rate": 8 * gun_share,
+                   "gun_velocity": 8 * gun_share, "laser_damage": 17, "laser_charge": 12,
+                   "mortar_reload": 15, "mortar_velocity": 13, "mortar_splash": 10,
+                   "lightning_range": 18, "lightning_efficiency": 17}
+        if zone.next_radius <= 25:
+            weights["nanites"] *= 0.45
+
+        def value(choice):
+            ident = obj(choice).get("id")
+            if not isinstance(ident, str):
+                return 0
+            if ident.startswith(("gun_", "laser_", "mortar_", "lightning_")) and ident.split("_", 1)[0] not in kinds:
+                return 0
+            return weights.get(ident, 0)
+
+        return max(range(len(offer)), key=lambda i: value(offer[i]))
+
+    def practice_loot(self, obs, p, zone, target, threats, action):
+        kinds = tuple(w.get("kind") for w in p.weapons)
+        ranks = {"gun": 0, "mortar": 1, "lightning": 2, "laser": 3}
+        if target and "laser" in target.armed:
+            ranks["lightning"] = 4
+        elif target and "lightning" in target.armed:
+            ranks["mortar"], ranks["lightning"] = 3, 1
+        spare = next((i for i, kind in enumerate(kinds) if kind is None), None)
+        swap = next((i for i, kind in enumerate(kinds) if isinstance(kind, str) and kind in ranks and kind != "gun"
+                     and number(p.weapons[i].get("charge")) <= 0), None)
+        take, goal = None, None
+        reach = limit(number(self.loot.get("pickup_radius"), 4), 0.5, 15)
+        if spare is not None or swap is not None:
+            nearest = min((c.dist for c in threats), default=math.inf)
+            for item in seq(obs.get("pickups"))[:48]:
+                item = obj(item)
+                point, ident = vec(item.get("pos"), 3), number(item.get("id"), -1)
+                kind = item.get("kind")
+                rank = ranks.get(kind, 0) if isinstance(kind, str) else 0
+                if (point is None or ident < 0 or rank == 0 or kind in kinds
+                        or (spare is None and rank <= ranks[kinds[swap]])):
+                    continue
+                d, dz = distance(p.pos, point), abs(p.pos[2] - point[2])
+                score = rank * 7 - d - dz * 1.5
+                if d <= reach and dz <= 4:
+                    if take is None or score > take[0]:
+                        take = score, ident
+                elif (d < (56 if spare is not None else 23) and nearest > max(27, 32 + d * 1.65)
+                      and dz <= 18 and zone.gap(point, 8) > 3):
+                    if goal is None or score > goal[0]:
+                        goal = score, point
+        if take is not None:
+            action["take"] = take[1]
+            if spare is None:
+                action["drop"] = swap
+            goal = None
+
+        # When the kill was behind a corner, first get close enough to see its drops.
+        collects = []
+        located = set()
+        cube_reach = limit(number(self.cubes.get("pickup_radius"), 3.5), 0.5, 15)
+        for item in seq(obs.get("cubes"))[:64]:
+            point = vec(obj(item).get("pos"), 3)
+            if point is None:
+                continue
+            d, dz = distance(p.pos, point), abs(p.pos[2] - point[2])
+            sources = [ident for ident, (site, _) in self.kill_sites.items()
+                       if distance(site, point) < 13 and abs(site[2] - point[2]) < 8]
+            located.update(sources)
+            from_kill = bool(sources)
+            if d < (100 if from_kill else 38) and dz <= 22 and (d > cube_reach * 0.65 or dz > 4):
+                collects.append((d + dz * 2 - (70 if from_kill else 0), point, from_kill))
+        for ident, (point, _) in tuple(self.kill_sites.items()):
+            d, dz = distance(p.pos, point), abs(p.pos[2] - point[2])
+            if d <= cube_reach and dz <= 4:
+                del self.kill_sites[ident]
+            elif ident not in located and 4 < d < 100 and dz <= 22:
+                collects.append((d + dz * 2 - 51, point, True))
+        for _, point, from_kill in sorted(collects):
+            if zone.gap(point, 4) < 1:
+                continue
+            d = distance(p.pos, point)
+            if not threats or (from_kill and len(threats) == 1 and d <= 22
+                               and distance(threats[0].pos, point) > max(31, d * 2.1)):
+                return point, "collect"
+        return (goal[1], "equip") if goal else (None, "search")
+
+    def firing_pose(self, p, action, delay):
+        move = action.get("move", (0, 0))
+        pace = p.boost if p.grounded and action.get("boost") else p.walk
+        if any(number(w.get("charge")) > 0 for w in p.weapons):
+            pace *= limit(self.phys("charge_move_mult", 0.5, p.stats), 0.1, 1)
+        acceleration = self.phys("ground_accel", 58.5, p.stats) if p.grounded else self.phys("air_accel", 12, p.stats)
+        desired = move[0] * pace, move[1] * pace
+        x, y, z = p.pos
+        vel = p.vel[:2]
+        left = delay
+        while left > 1e-6:
+            dt = min(left, self.physics_dt)
+            vel = accelerate(vel, desired, max(0, acceleration) * dt)
+            x, y = x + vel[0] * dt, y + vel[1] * dt
+            left -= dt
+        return x, y, z + (0 if p.grounded else p.vel[2] * delay)
+
+    def shot(self, p, target, weapon, action):
+        kind = weapon.get("kind")
+        if kind not in ("gun", "mortar", "laser", "lightning"):
+            return None
+        if kind == "gun" and (number(weapon.get("reload")) > 0 or number(weapon.get("ammo"), 1) <= 0):
+            return None
+        if kind == "lightning" and p.energy < max(4, 1.15 * self.setting(weapon, "energy", 3)):
+            return None
+        if kind == "mortar" and not 22 <= target.dist <= 163:
+            return None
+        speed = self.setting(weapon, "speed", 252 if kind == "gun" else 72) if kind in ("gun", "mortar") else 0
+        if kind in ("gun", "mortar") and speed <= 1:
+            return None
+        gravity = max(0, self.setting(weapon, "gravity", 22)) if kind == "mortar" else 0
+        reach = self.setting(weapon, "range", {"gun": 230, "laser": 280, "lightning": 45, "mortar": 170}[kind])
+        if target.dist > reach + 4:
+            return None
+        cooldown = number(weapon.get("cooldown"))
+        delay = limit(cooldown, self.physics_dt, self.dt)
+        base = self.firing_pose(p, action, delay)
+        origin = raised(base, p.height + 0.5 if kind == "mortar" else self.phys("muzzle_height", 7, p.stats))
+        if target.kind == "mech":
+            height, radius = self.phys("height", 9) * target.scale, self.phys("radius", 2.5) * target.scale
+        else:
+            body = self.npc if target.kind == "npc" else self.crates
+            height = number(body.get("height"), 3.5 if target.kind == "npc" else 2.4)
+            radius = number(body.get("radius"), 1.8)
+        barrel = p.radius + 0.5
+        aim = intercept(origin, raised(target.pos, height * 0.52), target.vel, delay, speed, barrel, gravity)
+        if aim is None:
+            return None
+        (dx, dy, dz), flight = aim
+        length = math.hypot(dx, dy, dz)
+        if kind != "mortar" and length > reach:
+            return None
+        yaw, pitch = math.atan2(dy, dx), math.atan2(dz, math.hypot(dx, dy))
+        lo, hi = self.phys("min_pitch", -0.7, p.stats), self.phys("max_pitch", 1.3, p.stats)
+        if kind != "lightning" and not lo <= pitch <= hi:
+            return None
+        if self.arena is not None:
+            end = raised((origin[0] + dx, origin[1] + dy, origin[2] + dz), -0.5 * gravity * flight**2)
+            if kind == "mortar":
+                previous = origin
+                for i in range(1, 10):
+                    f = i / 9
+                    following = origin[0] + f * dx, origin[1] + f * dy, origin[2] + f * dz - gravity * (f * flight)**2 / 2
+                    if self.arena.solid(following) or not self.arena.clear_ray(previous, following):
+                        return None
+                    previous = following
+            elif not self.arena.clear_ray(origin, end):
+                return None
+        width = (math.radians(self.setting(weapon, "cone_deg", 30)) * 0.42 if kind == "lightning"
+                 else math.atan2(max(0.65, radius * (1.10 if kind == "mortar" else 0.79)), max(1, math.hypot(dx, dy))))
+        vertical = math.atan2(max(0.65, height * 0.36), max(1, math.hypot(dx, dy)))
+        return yaw, limit(pitch, lo, hi), width, vertical, flight
+
+    def aligned(self, p, kind, shot, commanded=None):
+        yaw, pitch, width, height, _ = shot
+        if commanded is not None and (abs(angle(yaw - commanded[0])) > width
+                                      or (kind != "lightning" and abs(pitch - commanded[1]) > height)):
+            return False
+        # Allow a fraction of one sim step of turning before a ready trigger can fire.
+        yaw_step = limit(self.phys("turn_rate", 4, p.stats), 0, 20) * self.physics_dt * 0.68
+        pitch_step = limit(self.phys("pitch_rate", 3, p.stats), 0, 20) * self.physics_dt * 0.68
+        return (abs(angle(yaw - p.aim[0])) <= width + yaw_step
+                and (kind == "lightning" or abs(pitch - p.aim[1]) <= height + pitch_step))
+
+    def shoot(self, p, targets, action, until):
+        fire = action["fire"] = [False, False]
+        active_charge = next((i for i, w in enumerate(p.weapons) if w.get("kind") == "laser"
+                              and number(w.get("charge")) > 0), None)
+        fire_now = None
+        for target in targets[:3]:
+            shots = []
+            for i, w in enumerate(p.weapons):
+                if time.perf_counter() >= until:
+                    break
+                shot = self.shot(p, target, w, action)
+                if shot is None:
+                    continue
+                kind = w["kind"]
+                priority = {"gun": 18, "laser": 44, "lightning": 48, "mortar": 34}[kind]
+                if kind == "laser" and "mortar" in target.armed or kind == "lightning" and "laser" in target.armed:
+                    priority += 17
+                if kind == "mortar":
+                    priority -= shot[-1] * (4 + 0.45 * math.hypot(*target.vel[:2]))
+                if i == active_charge:
+                    priority += 90
+                if kind == "gun" and target.hp <= self.setting(w, "damage", 45):
+                    priority += 45
+                priority -= min(2.0, number(w.get("cooldown"))) * 70
+                shots.append((priority, i, shot))
+            if shots:
+                _, chosen, plan = max(shots)
+                action["aim"] = list(plan[:2])
+                for _, i, shot in shots:
+                    weapon, kind = p.weapons[i], p.weapons[i]["kind"]
+                    aligned = self.aligned(p, kind, shot, plan)
+                    ready = number(weapon.get("cooldown")) <= self.dt + 0.001
+                    if kind == "laser":
+                        charge, full = number(weapon.get("charge")), max(0.05, self.setting(weapon, "charge", 0.75))
+                        minimum = self.setting(weapon, "min_charge", 0.15)
+                        damage = self.setting(weapon, "damage", 315)
+                        frac = limit(self.setting(weapon, "min_frac", 0.35), 0, 1)
+                        predicted = damage * (frac + (1 - frac) * min(1, charge / full))
+                        if charge > 0:
+                            fire[i] = not (aligned and (charge >= full - 0.021 or charge >= minimum and predicted > target.hp * 1.08))
+                            if not fire[i]:
+                                fire_now = target.id
+                        elif chosen == i and ready and abs(angle(shot[0] - p.aim[0])) < 0.40:
+                            fire[i] = True
+                    elif ready and aligned:
+                        fire[i] = True
+                        fire_now = target.id
+                break
+        else:
+            # Hold briefly while tracing a mech behind a corner. A full charge eventually
+            # fires on its own, so clear it once there is no longer an upcoming peek.
+            if active_charge is not None and targets:
+                w = p.weapons[active_charge]
+                fire[active_charge] = number(w.get("charge")) < self.setting(w, "charge", 0.75)
+        if fire_now is not None:
+            self.last_fire_target = fire_now
+        for i, w in enumerate(p.weapons):
+            if w.get("kind") == "gun" and not fire[i] and number(w.get("reload")) <= 0:
+                ammo = number(w.get("ammo"), math.inf)
+                if ammo <= 0 or (not targets and ammo < self.setting(w, "mag", 12) * 0.82):
+                    action["reload"] = True
+
+    def line(self, p, source, point):
+        height = 7 * source.scale if source.kind == "mech" else 2.2
+        return self.arena.clear_ray(raised(source.pos, height), raised(point, p.height * 0.58))
+
+    def duel_cover(self, p, zone, target, threats, central, isolate, until):
+        arena = self.arena
+        if arena is None:
+            return None
+        key = tuple(c.id for c in threats), central, isolate
+        if key == self.cover_key and zone.now < self.cover_until and (self.cover is None or distance(p.pos, self.cover) < 29):
+            if self.cover is None or (zone.gap(self.cover, 1.5) > 0 and
+                                      not any(self.line(p, c, self.cover) for c in threats[:2])):
+                return self.cover
+        self.cover, self.cover_key, self.cover_until = None, key, zone.now + 0.55
+        best = -math.inf
+        for radius in (0, 6, 11, 18, 27):
+            for dx, dy in COVER_ANGLES if radius else ((0, 0),):
+                if time.perf_counter() >= until:
+                    return self.cover
+                xy = p.pos[0] + radius * dx, p.pos[1] + radius * dy
+                cell = arena.cell(*xy)
+                if (cell is None or not arena.ground_ok(cell, p.radius) or zone.gap(xy, 2) < 1
+                        or arena.near_cover(xy) > 16):
+                    continue
+                point = (*xy, p.pos[2] if radius == 0 else arena.floor[cell])
+                if abs(point[2] - p.pos[2]) > 3 or not arena.corridor(p.pos, point, p.radius, p.height):
+                    continue
+                exposed = sum(self.line(p, c, point) for c in threats[:3])
+                if exposed > (1 if central or isolate else 0):
+                    continue
+                score = (13 - radius * 0.47 - 1.25 * abs(arena.near_cover(point) - (p.radius + 4))
+                         - 18 * exposed - (0.8 * distance(point, zone.next_center) if central else 0))
+                if target:
+                    score += 0.21 * limit(distance(point, target.pos) - target.dist, -20, 20)
+                if score > best:
+                    best, self.cover = score, point
+        return self.cover
+
+    def strafe_move(self, p, zone, target, threats, retreat, hazards, until, terminal, central):
+        now = zone.now
+        if now >= self.stride_until or self.duel_target != target.id:
+            self.duel_target = target.id
+            self.stride_until = now + self.rng.uniform(0.41, 1.04)
+            self.strafe = -self.strafe if self.rng.random() < 0.81 else self.strafe
+            self.stride = self.rng.uniform(0.74, 1.38)
+            self.sprint = self.rng.random() < 0.44
+        course = bearing(p.pos, target.pos)
+        low, high = self.range_band(p, target)
+        radial = limit((target.dist - (low + high) / 2) / max(8, (high - low) * 0.65), -1.8, 1.8)
+        if retreat:
+            radial = -1.35
+        tangent = self.strafe * self.stride
+        if target.aim is not None:
+            facing = angle(bearing(target.pos, p.pos) - target.aim[0])
+            if 0.56 < abs(facing) < 2.35 and not retreat:
+                # In our frame the tangent in the opposite direction increases the flank angle.
+                tangent -= math.copysign(0.30, facing)
+        yaw = course + math.atan2(tangent, radial)
+        boost = p.grounded and p.energy > (26 if retreat else 38) and (bool(hazards) or retreat or self.sprint)
+        pace = p.boost if boost else p.walk
+        if any(number(w.get("charge")) > 0 for w in p.weapons):
+            pace *= 0.5
+        arena = self.arena
+        own_line = target.clear
+        best, move = -math.inf, (math.cos(yaw), math.sin(yaw))
+        for offset in (0, 0.38, -0.38, 0.77, -0.77, 1.28, -1.28, 1.85, -1.85, math.pi):
+            if time.perf_counter() >= until:
+                break
+            direction = yaw + offset
+            dx, dy = math.cos(direction), math.sin(direction)
+            endpoint = (p.pos[0] + 0.12 * p.vel[0] + 0.43 * pace * dx,
+                        p.pos[1] + 0.12 * p.vel[1] + 0.43 * pace * dy, p.pos[2])
+            if arena is not None and not arena.corridor(p.pos, endpoint, p.radius, p.height):
+                continue
+            score = -abs(offset) * 2.2
+            if not terminal:
+                score -= max(0, min(7, zone.radius * 0.3) - zone.gap(endpoint, 0.8)) * 4.4
+                if central:
+                    score -= max(0, distance(endpoint, zone.next_center) - max(4, zone.next_radius * 0.5)) * 4.4
+            if arena is not None:
+                others = sum(self.line(p, c, endpoint) for c in threats[:3] if c.id != target.id)
+                target_line = self.line(p, target, endpoint)
+                score -= 12 * others + 18 * (others and target_line)
+                if retreat:
+                    score += 9 * (not target_line)
+                elif own_line:
+                    score -= 3 * (not target_line)
+                else:
+                    score += 5 * target_line
+                score += 0.20 * max(0, 15 - arena.near_cover(endpoint))
+            for impact, seconds, reach in hazards:
+                future = p.pos[0] + dx * pace * seconds, p.pos[1] + dy * pace * seconds
+                score -= max(0, reach - distance(future, impact)) * 2.6
+            if score > best:
+                best, move = score, (dx, dy)
+        return {"move": list(move), "boost": boost, "jump": False}
+
+    def ready_in(self, p, target):
+        waits = []
+        for w in p.weapons:
+            kind = w.get("kind")
+            cooldown = number(w.get("cooldown"))
+            if kind == "gun":
+                reload = number(w.get("reload"))
+                if reload <= 0 and number(w.get("ammo"), 1) <= 0:
+                    reload = self.setting(w, "reload", 2.4)
+                waits.append(max(reload, cooldown))
+            elif kind == "laser" or (kind == "mortar" and 22 < target.dist < 115):
+                waits.append(cooldown)
+            elif kind == "lightning" and target.dist < self.setting(w, "range", 45) and p.energy >= 4:
+                waits.append(cooldown)
+        return min(waits, default=0)
+
+    def act(self, obs):
+        start = time.perf_counter()
+        until = start + PLAN_BUDGET_S
+        obs = obj(obs)
+        me, z = obj(obs.get("self")), obj(obs.get("zone"))
+        pos = vec(me.get("pos"), 3)
+        if pos is None:
+            return {}
+        p = self.pilot(me, pos)
+        now = number(obs.get("t"), number(obs.get("tick")) * self.physics_dt)
+        center = vec(z.get("center"), 2) or pos[:2]
+        radius = limit(number(z.get("radius"), 560), 0, 2000)
+        zone = Zone(center, radius, vec(z.get("next_center"), 2) or center,
+                    limit(number(z.get("next_radius"), radius), 0, radius), number(z.get("shrink_start"), now),
+                    number(z.get("shrink_end"), now + 99), now, max(0, number(z.get("dps"))))
+        in_zone = me.get("in_zone") if isinstance(me.get("in_zone"), bool) else zone.gap(pos) >= 0
+        goal, urgent = zone.anchor(pos, p.walk)
+        terminal = (not in_zone and zone.next_radius == 0 and zone.dps > 0 and
+                    (-zone.gap(pos) > p.boost * min(p.hp / zone.dps, max(0, self.match_end - now))
+                     or zone.radius == 0 and distance(pos, center) < 1e-6))
+        if terminal:
+            goal, urgent = pos[:2], False
+        elif not in_zone and not urgent:
+            goal, urgent = center, True
+        central = (zone.next_radius <= 25 and (zone.end - now < 95 or zone.radius <= 45)) and not terminal
+        self.remember(obs, now)
+        eye = limit(self.phys("eye_height", 8, p.stats), 1, 80)
+        contacts = self.contacts(obs, pos, eye)
+        rivals = self.practice_contacts(obs, p, contacts, now)
+        threats = [c for c in rivals if c.id in self.pursuers or (c.clear and c.dist < 75 and c.face_error < 0.72)]
+        threats.sort(key=lambda c: (not c.clear, c.dist))
+        self.hunter_count = max(self.hunter_count, len(threats))
+        squad = self.hunter_count >= 2 and len(threats) >= 2
+        candidates = [c for c in rivals if central or terminal or not threats or c in threats
+                      or (c.clear and c.dist < 88 and c.hp < 330)]
+        targets = sorted(candidates, key=self.target_merit, reverse=True)
+        target = targets[0] if targets else None
+        if target and squad and not target.clear:
+            target = next((c for c in targets if c.clear), target)
+        action = {}
+        offer = seq(obj(obs.get("offer")).get("choices"))[:3]
+        if offer:
+            action["pick"] = self.upgrade(offer, p, zone)
+        loot, loot_phase = self.practice_loot(obs, p, zone, target, threats, action)
+        hazards = self.nearby_shells(obs, pos, p.vel, p.height)
+        just_hit = now - self.last_damage < HIT_MEMORY_S
+        sound = self.damage_bearing if just_hit else self.sound_bearing if now - self.last_sound < SOUND_MEMORY_S else None
+        track = self.heard_goal(obs, pos, now)
+        repair_wait = max(0, self.phys("regen_delay", 5, p.stats) - (now - self.last_repair_reset))
+        can_repair = (in_zone and not central and self.phys("regen_per_s", 45, p.stats) > 0
+                      and self.match_end - now > repair_wait + 3)
+        can_finish = target and target.clear and target.hp <= max(140, p.hp * 0.28)
+        self.repairing = can_repair and (p.fraction < (0.84 if self.repairing else 0.52)) and not can_finish
+        engaged = target and (target.clear or target.id in self.pursuers or now - self.last_damage < 2)
+        exposed = sum(c.clear for c in threats[:3])
+        cooldown_cover = target and self.ready_in(p, target) > 0.65 and target.dist > 23
+        if target and target.clear:
+            self.peek = target.id, pos, now
+        cover = None
+        near_center = distance(pos, zone.next_center) < max(10, zone.next_radius * 0.65)
+        if not urgent and (central and near_center or self.repairing or cooldown_cover or squad and exposed > 1):
+            cover = self.duel_cover(p, zone, target, threats or ([target] if target else []), central,
+                                    squad and exposed > 1 and not self.repairing and not cooldown_cover,
+                                    min(until, start + 0.00225))
+
+        self.phase = "search"
+        if urgent:
+            self.phase = "zone"
+        elif central and (not near_center or cover is not None and (not exposed or distance(pos, cover) > 2)):
+            goal = cover or zone.next_center
+            self.phase = "center"
+        elif loot is not None and (not self.repairing or loot_phase == "collect") and not terminal:
+            goal, self.phase = loot[:2], loot_phase
+        elif self.repairing and cover is not None:
+            goal, self.phase = cover, "repair"
+        elif (cover is not None and (cooldown_cover or squad and exposed > 1) and not can_finish
+              and (not exposed or distance(pos, cover) > 2 or not self.line(p, target, cover))):
+            goal, self.phase = cover, "hide"
+        elif (target and not target.clear and self.peek and self.peek[0] == target.id
+              and now - self.peek[2] < 2.4 and distance(pos, self.peek[1]) >= 2.1):
+            goal, self.phase = self.peek[1][:2], "peek"
+        elif target and (target.clear or terminal):
+            self.phase = "fight"
+            action.update(self.strafe_move(p, zone, target, threats,
+                                           not terminal and (self.repairing or squad and exposed > 1),
+                                           hazards, min(until, time.perf_counter() + 0.00175), terminal, central))
+        elif target and (engaged or not self.repairing) and not terminal:
+            goal, self.phase = target.pos[:2], "pursuit"
+        elif self.repairing:
+            self.phase = "repair"
+            if just_hit and sound is not None:
+                goal = pos[0] - 23 * math.cos(sound), pos[1] - 23 * math.sin(sound)
+            elif distance(pos, zone.next_center) > 7:
+                goal = zone.next_center
+            else:
+                yaw = self.scout_yaw + 1.6 * math.floor(now / 1.4)
+                goal = pos[0] + 5 * math.cos(yaw), pos[1] + 5 * math.sin(yaw)
+        elif sound is not None and not terminal:
+            goal = pos[0] + 41 * math.cos(sound), pos[1] + 41 * math.sin(sound)
+        elif track is not None and not terminal:
+            goal = track
+        elif not terminal:
+            sweep = self.scout_yaw + 1.71 * math.floor(now / 6)
+            goal = zone.next_center[0] + 0.27 * zone.next_radius * math.cos(sweep), zone.next_center[1] + 0.27 * zone.next_radius * math.sin(sweep)
+
+        if "move" not in action:
+            if self.arena is not None:
+                goal = self.arena.inset(goal, p.radius + 0.4)
+            waypoint = self.route(pos, goal, zone, p.radius, p.height, now < self.stuck_until,
+                                  min(until, time.perf_counter() + ROUTE_SLICE_S))
+            steering = threats if urgent or self.phase in ("hide", "repair", "center") else []
+            action.update(self.movement(pos, p.vel, waypoint, zone, urgent, bool(hazards), steering, hazards,
+                                        sound, p.stats, p.grounded, p.energy, now,
+                                        min(until, time.perf_counter() + 0.00115), in_zone, terminal, None))
+            if (self.phase in ("collect", "equip") and not threats and p.grounded
+                    and p.energy > 54 and distance(pos, waypoint) > 10):
+                action["boost"] = True
+            if (loot is not None and self.phase in ("collect", "equip") and loot[2] - pos[2] > 4
+                    and distance(pos, loot) < 24 and p.energy > 17 and self.arena is not None
+                    and not self.arena.solid(raised(pos, p.height + 1))):
+                action["jump"], action["boost"] = p.grounded, not p.grounded
+        direction = (bearing(pos, target.pos) if target else sound if sound is not None
+                     else angle(bearing(pos, goal) + 0.74 * math.sin(1.35 * now + self.scout_yaw)))
+        action["aim"] = [direction, 0.0]
+
+        # Hold the repair timer once we have broken contact. Emergency shots remain available
+        # when a hunter has a clear line or we can end the fight quickly.
+        if self.repairing and not can_finish and not (target and target.clear and (cover is None or target.dist < 24)):
+            targets = []
+        if not targets and not self.repairing and not urgent and loot is None and not terminal:
+            targets = [c for c in contacts if c.kind == "npc" and c.clear and c.hp > 0 and
+                       (c.attacker and c.dist < 47 or c.dist < 32 and c.hp < 250)]
+            for item in seq(obs.get("crates"))[:24]:
+                item = obj(item)
+                loc, ident = vec(item.get("pos"), 3), number(item.get("id"), None)
+                if loc is not None and ident is not None and (d := distance(loc, pos)) < 37 and abs(loc[2] - pos[2]) < 5:
+                    targets.append(Contact(ident, "crate", loc, ZERO, None, number(item.get("hp"), 300),
+                                           300, 1, d, 0, True, False, False, ()))
+            targets.sort(key=lambda c: (c.kind != "npc", c.dist))
+        self.shoot(p, targets, action, until)
+        if self.phase in ("hide", "repair") and not exposed and not any(action["fire"]):
+            if any(w.get("kind") == "gun" and number(w.get("ammo"), math.inf) <= 5 for w in p.weapons):
+                action["reload"] = True
+        return action
+
+
 if __name__ == "__main__":
-    mf.run(Bot)
+    mf.run(PracticeBot if PLAY_MODE == "practice" else Bot)
