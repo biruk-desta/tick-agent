@@ -27,7 +27,6 @@ import math
 import os
 import select
 import signal
-import re
 import statistics
 import sys
 import time
@@ -564,7 +563,7 @@ def _decision(bot, obs, tick, pause_show):
     return None
 
 
-def run(make_bot: Any, *, pause_show: bool = False, practice_wire: bool = False) -> None:
+def run(make_bot: Any, *, pause_show: bool = False) -> None:
     """Run a bot until end or EOF, with a watchdog around each decision."""
     global pause_ms
     pause_ms = (None, None)
@@ -584,20 +583,12 @@ def run(make_bot: Any, *, pause_show: bool = False, practice_wire: bool = False)
     latest = None
     batch_start = None
     frames = 0
-    default_observation = False
     for raw, received in _lines(sys.stdin.fileno()):
         if raw is not None:
             try:
                 msg = json.loads(raw)
             except (ValueError, RecursionError):
                 msg = None
-                if (practice_wire and (bot is None or bot.mode == "practice")
-                        and re.search(rb'"type"\s*:\s*"obs"', raw)):
-                    match = re.search(rb'"tick"\s*:\s*(-?\d{1,16})(?![\d.])', raw)
-                    if latest is None:
-                        batch_start = received
-                    latest = {"tick": int(match[1])} if match else {}
-                    default_observation = True
             if isinstance(msg, dict):
                 kind = msg.get("type")
                 if kind == "hello" and not handshaken:
@@ -620,7 +611,6 @@ def run(make_bot: Any, *, pause_show: bool = False, practice_wire: bool = False)
                         batch_start = received
                     observations += 1
                     latest = msg
-                    default_observation = practice_wire and bot is None
                 elif kind == "end":
                     return
         if latest is None:
@@ -653,14 +643,177 @@ def run(make_bot: Any, *, pause_show: bool = False, practice_wire: bool = False)
         last_tick = tick
         remaining = deadline - WRITE_RESERVE_S - time.perf_counter()
         payload = (_watched(remaining, _decision, bot, obs, tick, pause_show)
-                   if bot is not None and remaining > 0 and not default_observation else None)
+                   if bot is not None and remaining > 0 else None)
         if payload is None or len(payload) > frame_limit:
-            if default_observation:
-                payload = _encode({"tick": tick})
-            else:
-                payload = _encode_action(_fallback(obs, tick), obs, pause_show)
+            payload = _encode_action(_fallback(obs, tick), obs, pause_show)
         sent = _send(stdout, payload, deadline)
         last_sent = sent if valid_tick else None
+
+
+PRACTICE_QUEUE = 256
+PRACTICE_LINE = 1 << 20
+PRACTICE_BUDGET = 0.050
+PRACTICE_WRITE_RESERVE = 0.0005
+
+
+def _fields(**groups):
+    return {key: kind for names, kind in groups.items() for key in names.split("__")}
+
+
+_POSITION = _fields(id=int, pos=(float, 3))
+_ITEM = {**_POSITION, **_fields(hp=float, kind=str)}
+_ACTOR = {**_ITEM, **_fields(vel=(float, 3), aim=(float, 2), hp__max_hp=float,
+                           cubes=int, weapons=(str,), charging=bool)}
+_WEAPON = _fields(kind=str, ammo=int, stats=(dict, float), cooldown__reload__charge=float)
+_SELF = {**_ACTOR, **_fields(energy__max_energy=float, grounded__in_zone=bool,
+                            upgrades=(str,), stats=(dict, float), weapons=(_WEAPON,))}
+_ZONE = _fields(center__next_center=(float, 2), radius__next_radius__shrink_start__shrink_end__dps=float)
+_EVENT = _fields(type__weapon__effect__kind=str, by__target__id__slot__cubes=int,
+                 amount__bearing=float, rear=bool)
+_OBS = _fields(tick__alive=int, t=float, self=_SELF, zone=_ZONE, mechs=(_ACTOR,),
+               crates__cubes__pickups=(_ITEM,), events=(_EVENT,),
+               projectiles=({**_POSITION, **_fields(vel=(float, 3), kind=str)},),
+               beams=(_fields(by=int, kind=str, path=((float, 3),), age=float),),
+               sounds=(_fields(kind__dist=str, bearing__age=float),),
+               drops=({**_POSITION, **_fields(holder=int, radius__lands_in__capture_s__progress=float)},),
+               offer=_fields(id=int, expires=float, choices=(_fields(id__name__desc=str),)))
+_HELLO = _fields(slot=int, protocol=str, map=_fields(dir=str, files=(str,)),
+                 config=_fields(mech__npc__crates=(dict, float),
+                                weapons=(dict, (dict, float)),
+                                cubes=_fields(stat_cap=int, size_per_cube__damage_per_cube=float),
+                                loot=_fields(pickup_radius=float)))
+
+
+def _wire_type(value, schema):
+    # JSON null leaves a Go scalar/struct at zero and a pointer/slice nil.
+    if value is None:
+        return True
+    if schema is float:
+        return ((type(value) is float and math.isfinite(value))
+                or (type(value) is int and abs(value) <= sys.float_info.max))
+    if schema is int:
+        return type(value) is int and -(1 << 63) <= value < 1 << 63
+    if isinstance(schema, dict):
+        return isinstance(value, dict) and all(
+            _wire_type(value[key], kind) for key, kind in schema.items() if key in value)
+    if isinstance(schema, tuple):
+        kind = schema[0]
+        if kind is dict:
+            return isinstance(value, dict) and all(_wire_type(v, schema[1]) for v in value.values())
+        return isinstance(value, list) and all(
+            _wire_type(v, kind) for v in (value[:schema[1]] if len(schema) == 2 else value))
+    return type(value) is schema
+
+
+def _practice_lines(fd):
+    """Read lines up to 1 MiB and preserve a final unterminated line."""
+    pending = bytearray()
+    discarding = False
+    while chunk := os.read(fd, PRACTICE_LINE):
+        *complete, tail = chunk.split(b"\n")
+        for line in complete:
+            if not discarding and len(pending) + len(line) <= PRACTICE_LINE:
+                yield bytes(pending) + line, time.perf_counter()
+            pending.clear()
+            discarding = False
+        if not discarding:
+            if len(pending) + len(tail) <= PRACTICE_LINE:
+                pending.extend(tail)
+            else:
+                pending.clear()
+                discarding = True
+    if pending:
+        yield bytes(pending), time.perf_counter()
+
+
+def _practice_decision(bot, obs, tick):
+    return _encode({**bot.act(obs), "tick": tick})
+
+
+def _reject_constant(value):
+    raise ValueError(value)
+
+
+def run_practice(make_bot):
+    """Practice wire loop. The legacy and FFA transport stays on run()."""
+    from queue import Empty, Queue
+    from threading import Thread
+
+    gc.disable()
+    signal.signal(signal.SIGALRM, _interrupt)
+    stdout = sys.stdout.fileno()
+    os.set_blocking(stdout, False)
+    frame_limit = os.fpathconf(stdout, "PC_PIPE_BUF")
+    bot = None
+
+    def initialize(hello):
+        candidate = make_bot(hello)
+        candidate.load_map()
+        return candidate
+
+    def respond(obs, observed):
+        tick = obs.get("tick")
+        tick = tick if tick is not None and _wire_type(tick, int) else 0
+        deadline = observed + PRACTICE_BUDGET
+        payload = None
+        if bot is None or not _wire_type(obs, _OBS):
+            payload = _encode({"tick": tick})
+        else:
+            remaining = deadline - time.perf_counter() - PRACTICE_WRITE_RESERVE
+            if remaining > 0:
+                payload = _watched(remaining, _practice_decision, bot, obs, tick)
+            if payload is None or len(payload) > frame_limit:
+                bot.practice_fallbacks += 1
+                log(f"practice2 fallback {bot.practice_fallbacks}: transport guard")
+                payload = _encode({"tick": tick, "aim": bot.practice2.last_aim})
+        _send(stdout, payload, deadline)
+
+    inbox = Queue(PRACTICE_QUEUE)
+
+    def read_input(fd):
+        try:
+            for frame in _practice_lines(fd):
+                inbox.put(frame)
+        finally:
+            inbox.put(None)
+
+    def probe(block):
+        while True:
+            try:
+                frame = inbox.get() if block else inbox.get_nowait()
+            except Empty:
+                return "", None, None
+            if frame is None:
+                return "end", None, None
+            raw, observed = frame
+            try:
+                msg = json.loads(raw, parse_constant=_reject_constant)
+            except (ValueError, RecursionError):
+                continue
+            if isinstance(msg, dict) and msg.get("type") in ("obs", "hello", "end"):
+                return msg["type"], msg, observed
+
+    Thread(target=read_input, args=(sys.stdin.fileno(),), name="practice-input", daemon=True).start()
+    kind, msg, observed = probe(True)
+    while kind != "end":
+        if kind == "hello":
+            seed = msg.get("seed")
+            if ((seed is None or type(seed) is int and 0 <= seed < 1 << 64)
+                    and _wire_type(msg, _HELLO)):
+                bot = _watched(INIT_LIMIT_S, initialize, msg)
+                if bot is None:
+                    log("Practice initialization failed.")
+                _send(stdout, b'{"type":"ready"}\n', time.perf_counter() + PRACTICE_BUDGET)
+        elif kind == "obs":
+            latest, received = msg, observed
+            kind, msg, observed = probe(False)
+            while kind == "obs":
+                latest, received = msg, observed
+                kind, msg, observed = probe(False)
+            respond(latest, received)
+            if kind:
+                continue
+        kind, msg, observed = probe(True)
 
 
 if __name__ == "__main__":
