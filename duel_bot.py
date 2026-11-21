@@ -46,6 +46,16 @@ GUN_RANGE_M = 90.0          # preferred gun-only duel range (simulator: dodging 
 STRAFE_MIN_S = 0.3
 STRAFE_MAX_S = 0.7
 CRATE_FARM_M = 70.0
+# Arm early (practice only, switched on by royale.PRACTICE_ARM through DuelBot.arm): while we hold
+# only the gun, walk to a laser (else lightning) pickup seen this match when it is quiet.
+ARM_DETOUR_M = 150.0        # straight-line reach to a remembered or visible pickup
+ARM_CLEAR_M = 90.0          # no mech (seen or tracked) this close, else fight as before
+ARM_QUIET_S = 4.0           # and nothing has damaged us for this long
+ARM_BOOST_ENERGY = 35.0     # boost toward it above this energy (keeps a jet / dodge reserve)
+ARM_STALL_S = 6.0           # no 2 m of progress for this long while detouring: give that pickup up
+ARM_FORGET_M = 35.0         # in plain sight this close and not listed: someone took it
+ARM_CUBE_FIRST_M = 20.0     # a cube this close is collected on the way
+ARM_LASER_EDGE_M = 60.0     # a laser wins unless a lightning is this much closer
 
 
 class DuelBot(Bot):
@@ -64,6 +74,10 @@ class DuelBot(Bot):
         self.last_seen = {}        # mech id -> (time, pos)
         self.kill_spot = None      # (time, pos) where a victim died
         self.hunt_point = None     # (time, pos) best guess of where a hunter is
+        self.arm = False           # arm-early detour (practice only; set by royale.PRACTICE_ARM)
+        self.arm_seen = {}         # pickup id -> (kind, pos) for lasers and lightning seen this match
+        self.arm_banned = set()    # pickups given up on
+        self.arm_progress = None   # (id, best distance, time of last progress, last arm tick)
 
     # ------------------------------------------------------------------ targets
     def track(self, contacts):
@@ -266,6 +280,8 @@ class DuelBot(Bot):
         items = seq(me.get("weapons"))
         weapons = [obj(items[i]) if i < len(items) else {} for i in range(2)]
         kinds = {w.get("kind") for w in weapons if w.get("kind") in KNOWN_WEAPONS}
+        if self.arm:
+            self.arm_remember(obs, pos, eye)
         mechs = [c for c in contacts if c.kind == "mech"]
         if self.guarded:
             mechs = [c for c in mechs if self.engaging_us(c, pos)]
@@ -288,13 +304,22 @@ class DuelBot(Bot):
         if foe is not None and foe_share < 0.25 and fraction > 0.12:
             self.retreat_until = -math.inf   # finish it
         retreating = now < self.retreat_until or (len(visible) >= 3 and fraction < 0.6)
+        arm_goal = None
+        if self.arm and not (kinds - {"gun"}) and not urgent and not retreating and not terminal_burn:
+            arm_goal = self.arm_goal(pos, zone, contacts, walk, now)
 
         move = None
         boost = False
         self.mode = "roam"
         if self.arena is not None:
             goal = self.arena.inset(goal, radius + 0.4)
-        if not urgent and foe is not None and not retreating and not terminal_burn:
+        if arm_goal is not None:
+            # Arm early: take a laser or lightning before the next hunter arrives.
+            self.mode = "arm"
+            cube = self.cube_goal(obs, pos, zone, ARM_CUBE_FIRST_M)
+            goal = cube if cube is not None else arm_goal
+            boost = energy > ARM_BOOST_ENERGY and distance(pos, goal) > 12
+        elif not urgent and foe is not None and not retreating and not terminal_burn:
             self.mode = "duel"
             move, boost = self.engage_move(pos, foe, kinds, zone, now, radius, height, energy, fraction, hunters)
             cube = self.cube_goal(obs, pos, zone, FIGHT_CUBE_M) if fraction > RETREAT_FRACTION else None
@@ -410,6 +435,72 @@ class DuelBot(Bot):
             charging = any(f and w.get("kind") == "laser" for f, w in zip(action.get("fire", ()), weapons))
             action["boost"] = bool(boosting) and not charging
         return action
+
+    def aim_for(self, weapon, target, base, muzzle, pitch_bounds):
+        # With arm-early on, the laser is kept for mechs: the gun (or the arc) takes drones and crates.
+        if self.arm and target.kind != "mech" and weapon.get("kind") == "laser":
+            return None
+        return super().aim_for(weapon, target, base, muzzle, pitch_bounds)
+
+    def arm_remember(self, obs, pos, eye):
+        listed = set()
+        for item in seq(obs.get("pickups"))[:40]:
+            item = obj(item)
+            p, ident, kind = vec(item.get("pos"), 3), number(item.get("id"), None), item.get("kind")
+            if p is None or ident is None or ident < 0:
+                continue
+            listed.add(ident)
+            if kind in SECOND_RANK and ident not in self.arm_banned and (ident in self.arm_seen or len(self.arm_seen) < 64):
+                self.arm_seen[ident] = (kind, p)
+        for ident, (kind, p) in list(self.arm_seen.items()):
+            if ident in listed or distance(pos, p) > ARM_FORGET_M:
+                continue
+            if self.arena is None or self.arena.clear_ray(eb.raised(pos, eye), eb.raised(p, 0.6)):
+                del self.arm_seen[ident]     # in plain sight and gone: someone took it
+        for event in seq(obs.get("events"))[:40]:
+            event = obj(event)
+            if event.get("type") in ("took", "take_failed"):
+                ident = number(event.get("id"), None)
+                self.arm_seen.pop(ident, None)
+                if event.get("type") == "take_failed":
+                    self.arm_banned.add(ident)
+
+    def arm_goal(self, pos, zone, contacts, walk, now):
+        """Where to walk for a first laser (else lightning), or None when it is not quiet."""
+        if now - self.last_damage < ARM_QUIET_S:
+            return None
+        rivals = [c.pos for c in contacts if c.kind == "mech"]
+        if any(distance(pos, r) < ARM_CLEAR_M for r in rivals):
+            return None
+        best = None
+        for ident, (kind, p) in self.arm_seen.items():
+            if ident in self.arm_banned or abs(p[2] - pos[2]) > 4:
+                continue
+            d = distance(pos, p)
+            if d > ARM_DETOUR_M or zone.gap(p, d / max(1.0, walk) + eb.LOOT_SAFE_S) < 4:
+                continue
+            if any(distance(r, p) < eb.LOOT_CONTEST_M for r in rivals):
+                continue
+            choice = (-d + (ARM_LASER_EDGE_M if kind == "laser" else 0.0), ident, d)
+            if best is None or choice > best[0]:
+                best = (choice, p)
+        if best is None:
+            self.arm_progress = None
+            return None
+        ident, d = best[0][1], best[0][2]
+        prog = self.arm_progress
+        if prog is None or prog[0] != ident or now - prog[3] > 1.0:
+            prog = (ident, d, now, now)          # new target, or resumed after an interruption
+        elif d < prog[1] - 2.0:
+            prog = (ident, d, now, now)
+        else:
+            prog = (ident, prog[1], prog[2], now)
+        if now - prog[2] > ARM_STALL_S:
+            self.arm_banned.add(ident)           # no way there (roof, wall maze): stop trying
+            self.arm_progress = None
+            return None
+        self.arm_progress = prog
+        return best[1][:2]
 
     def cube_goal(self, obs, pos, zone, reach=140.0):
         best, goal = math.inf, None

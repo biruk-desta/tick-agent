@@ -20,6 +20,7 @@ from example_bot import obj, seq, number, vec, distance, bearing, angle, limit, 
 SEED = 1                    # the only source of randomness; a different value is a different draw
 FORCE_MODE = None           # None = detect; "practice" or "free-for-all" pins the policy
 GUARDED_OPENER = True       # squad play fights only mechs that attack or close on us
+PRACTICE_ARM = True         # squad play: fetch a laser (else lightning) early when it is quiet
 PAUSE_MED_MS = 8.0
 PAUSE_MIN_MS = 4.0
 PAUSE_SHOW = False
@@ -782,6 +783,7 @@ class Royale:
         duel_bot.SEED_SALT = SEED
         self.practice = duel_bot.DuelBot(hello)
         self.practice.guarded = GUARDED_OPENER
+        self.practice.arm = PRACTICE_ARM
         self.ffa = Selective(hello)
         self.detector = Detector(hello)
         self.mode = FORCE_MODE or "practice"
