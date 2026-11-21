@@ -6,12 +6,9 @@ from dataclasses import dataclass
 from functools import lru_cache
 import json
 import math
-from pathlib import Path
 from struct import Struct
 import sys
 import time
-
-from example_bot import angle, bearing, distance, limit, number, obj, raised, read_map_file, seq, vec
 
 
 ZERO = (0.0, 0.0)
@@ -24,15 +21,12 @@ SQUAD_STEPS = ((ZERO, 0),) + FIGHT_RING
 OPEN_STEPS = SQUAD_STEPS + tuple((direction, 12) for direction in HEADINGS)
 NEIGHBORS = ((1, 0), (-1, 0), (0, 1), (0, -1), (1, 1), (1, -1), (-1, 1), (-1, -1))
 RANK = {"laser": 4, "lightning": 3, "mortar": 1}
-OPEN_UPGRADES = ("Composite plating", "Reactive armor", "Tungsten rounds", "Repair nanites",
-                 "Rotary feed", "Superconductor", "Tesla coil", "Focusing lens", "Leg servos",
-                 "Fast capacitors")
-SQUAD_UPGRADES = ("Composite plating", "Reactive armor", "Focusing lens", "Fast capacitors",
-                  "Repair nanites", "Tungsten rounds", "Rotary feed", "Superconductor",
-                  "Tesla coil", "Leg servos")
-END_UPGRADES = ("Drum magazine", "Rail barrel", "Torso gyros", "Arc relay", "Reactor tune",
-                "Capacitor bank", "Autoloader", "Cluster shells", "Long tube", "Sensor suite",
-                "Efficient jets", "Phased beam")
+OPEN_UPGRADES = ("plating", "armor", "gun_damage", "nanites", "gun_rate",
+                 "lightning_efficiency", "lightning_range", "laser_damage", "servos", "laser_charge")
+SQUAD_UPGRADES = ("plating", "armor", "laser_damage", "laser_charge", "nanites",
+                  "gun_damage", "gun_rate", "lightning_efficiency", "lightning_range", "servos")
+END_UPGRADES = ("gun_mag", "gun_velocity", "gyros", "lightning_chain", "reactor", "capacitor",
+                "mortar_reload", "mortar_splash", "mortar_velocity", "sensors", "jets", "laser_pierce")
 FLOAT32 = Struct("=f")
 RNG_LENGTH, RNG_TAP = 607, 273
 WORD_MASK = (1 << 64) - 1
@@ -128,6 +122,48 @@ def f32(value):
     return FLOAT32.unpack(FLOAT32.pack(value))[0]
 
 
+def obj(value):
+    return value if isinstance(value, dict) else {}
+
+
+def seq(value):
+    return value if isinstance(value, (list, tuple)) else ()
+
+
+def number(value, default=0.0):
+    if type(value) in (int, float) and -1e9 <= value <= 1e9:
+        return value
+    return default
+
+
+def vec(value, n):
+    if isinstance(value, (list, tuple)) and len(value) >= n:
+        values = tuple(number(value[i], None) for i in range(n))
+        if None not in values:
+            return values
+    return None
+
+
+def limit(value, lo, hi):
+    return max(lo, min(hi, value))
+
+
+def angle(value):
+    return (value + math.pi) % math.tau - math.pi
+
+
+def bearing(a, b):
+    return math.atan2(b[1] - a[1], b[0] - a[0])
+
+
+def distance(a, b):
+    return math.hypot(a[0] - b[0], a[1] - b[1])
+
+
+def raised(pos, height):
+    return pos[0], pos[1], pos[2] + height
+
+
 def vector(value, size):
     return vec(value, size) or tuple(number(v) for v in (list(seq(value)) + [0] * size)[:size])
 
@@ -192,6 +228,19 @@ class Prism:
         left, bottom, right, top = self.bounds
         if x1 < left or x0 > right or y1 < bottom or y0 > top:
             return False
+        enter, leave = 0.0, 1.0
+        for origin, change, lo, hi in ((x, dx, left, right), (y, dy, bottom, top),
+                                       (z, dz, self.base, self.top)):
+            if abs(change) < 1e-9:
+                if origin < lo or origin > hi:
+                    return False
+            else:
+                a, b = (lo - origin) / change, (hi - origin) / change
+                if a > b:
+                    a, b = b, a
+                enter, leave = max(enter, a), min(leave, b)
+                if enter > leave:
+                    return False
         if self.base <= z <= self.top and self.contains(x, y):
             return True
         if abs(dz) > 1e-9:
@@ -214,23 +263,7 @@ class Prism:
 class PracticeMap:
     """Exact shot geometry, plus the two rasters used by the practice policy."""
 
-    def __init__(self, directory=None, *, world=None, heights=None):
-        if world is None:
-            try:
-                root = Path(directory or "/arena") / "v2"
-                world = json.loads(read_map_file(root / "world.json"))
-                raw = read_map_file(root / "terrain.i16")
-                samples = array("h", raw)
-                if sys.byteorder != "little":
-                    samples.byteswap()
-                terrain = world["terrain"]
-                if (terrain["step"] != 1 or not 2 <= terrain["nx"] <= 2048
-                        or not 2 <= terrain["ny"] <= 2048
-                        or len(samples) != terrain["nx"] * terrain["ny"]):
-                    raise ValueError("Invalid terrain grid")
-                heights = array("f", (h * 0.01 for h in samples))
-            except (OSError, ValueError, TypeError, KeyError, OverflowError):
-                world = FLAT_WORLD
+    def __init__(self, *, world=FLAT_WORLD, heights=None):
         terrain, bounds = world["terrain"], world["bounds"]
         self.x0, self.y0 = terrain["minX"], terrain["minY"]
         self.nx, self.ny = nx, ny = terrain["nx"], terrain["ny"]
@@ -274,10 +307,10 @@ class PracticeMap:
         fx, fy = u - i, v - j
         idx = j * self.nx + i
         g = self.heights
-        a = g[idx] + fx * (g[idx + 1] - g[idx])
+        a = g[idx] * (1 - fx) + g[idx + 1] * fx
         idx += self.nx
-        b = g[idx] + fx * (g[idx + 1] - g[idx])
-        return a + fy * (b - a)
+        b = g[idx] * (1 - fx) + g[idx + 1] * fx
+        return a * (1 - fy) + b * fy
 
     def local_prisms(self, x, y):
         return self.buckets.get((math.floor((x - self.bx) / 16), math.floor((y - self.by) / 16)), ())
@@ -288,23 +321,26 @@ class PracticeMap:
         return self.stack(ground, candidates, decks)
 
     @staticmethod
-    def stack(ground, candidates, decks=True):
+    def stack(ground, candidates, decks=True, with_support=False):
         surface = ground
+        support = None
         for _ in range(8):
             previous = surface
             for p in candidates:
                 if p.top > surface and (p.base <= surface + 1.5 or decks and p.bridge and p.top < ground + 6.5):
-                    surface = p.top
+                    surface, support = p.top, p
             if surface == previous:
                 break
-        return surface
+        return (surface, support) if with_support else surface
 
     def solid(self, point):
         x, y, z = point
         return z < self.bare(x, y) or any(p.base < z < p.top and p.contains(x, y)
                                           for p in self.local_prisms(x, y))
 
+    @lru_cache(maxsize=16384)
     def clear_ray(self, start, end):
+        """Cache exact endpoints; geometry is immutable after initialization."""
         x, y, z = start
         ex, ey, ez = end
         dx, dy, dz = ex - x, ey - y, ez - z
@@ -343,17 +379,24 @@ class PracticeMap:
         x0, y0 = self.x0, self.y0
         nx, ny = self.nx, self.ny
         width, blocks = self.block_width, self.block_max
+        rows = (ny + 7) // 8
+        move_x, move_y = abs(dx) > 1e-9, abs(dy) > 1e-9
+        edge_x, edge_y = x0 + (8 if dx > 0 else 0), y0 + (8 if dy > 0 else 0)
         t = 0.0
         at_z = z
         for _ in range(100001):
-            u, v = x + dx * t - x0, y + dy * t - y0
-            i = (0 if u < 0 else nx - 1 if u >= nx else int(u)) // 8
-            j = (0 if v < 0 else ny - 1 if v >= ny else int(v)) // 8
-            peak = blocks[j * width + i]
+            px, py = x + dx * t, y + dy * t
+            i, j = math.floor((px - x0) / 8), math.floor((py - y0) / 8)
+            in_grid = 0 <= i < width and 0 <= j < rows
+            peak = blocks[j * width + i] if in_grid else INF
             if at_z > peak:
-                tx = (8 * (i + (dx > 0)) + x0 - x) / dx if dx else INF
-                ty = (8 * (j + (dy > 0)) + y0 - y) / dy if dy else INF
-                edge = min(1, min(tx if tx > t else INF, ty if ty > t else INF) + 1e-6)
+                # A zero crossing time must enter the preceding block, not skip it.
+                tx = (8 * i + edge_x - px) / dx if move_x else INF
+                ty = (8 * j + edge_y - py) / dy if move_y else INF
+                crossing = tx if tx < ty else ty
+                edge = t + (crossing if crossing > 0 else 0) + 1e-6
+                if edge > 1:
+                    edge = 1
                 if z + dz * edge > peak:
                     # The epsilon reaches the adjoining block in either direction.
                     t, at_z = edge, z + dz * edge
@@ -376,7 +419,8 @@ class PracticeMap:
         spans = {}
         for p in self.prisms:
             _, low, _, high = p.bounds
-            for j in range(max(0, math.floor(low - self.y0)), min(ny, math.ceil(high - self.y0) + 1)):
+            interval = f32(p.base), f32(p.top), p.bridge
+            for j in range(max(0, math.ceil(low - self.y0)), min(ny, math.floor(high - self.y0) + 1)):
                 y = self.y0 + j + 0.0001
                 crossings = sorted(ax + (y - ay) * dx / dy
                                    for ax, ay, dx, dy in p.edges if (ay > y) != (ay + dy > y))
@@ -384,20 +428,20 @@ class PracticeMap:
                     start = j * nx + max(0, math.ceil(left - self.x0))
                     end = j * nx + min(nx, math.floor(right - self.x0) + 1)
                     for cell in range(start, end):
-                        spans.setdefault(cell, []).append(p)
+                        spans.setdefault(cell, []).append(interval)
         for cell, items in spans.items():
             ground = level = tops[cell]
-            for p in sorted(items, key=lambda p: p.base):
-                if p.top <= level:
+            for base, top, bridge in sorted(items, key=lambda interval: interval[0]):
+                if top <= level:
                     continue
-                if p.base <= level + 1.5:
-                    level = p.top
+                if base <= f32(level + 1.5):
+                    level = top
                 else:
-                    slabs.setdefault(cell, []).append((p.base, p.top))
-                    if p.base < level + 10.5 and not (p.bridge and p.top < ground + 6.5):
+                    slabs.setdefault(cell, []).append((base, top))
+                    if f32(base - level) < 10.5 and not (bridge and f32(top - ground) < 6.5):
                         obstacles[cell] = 1
             tops[cell] = level
-            if level > ground + 1.2:
+            if f32(level - ground) > f32(1.2):
                 obstacles[cell] = 1
         self.raster_ceiling = max(max(tops), self.solid_top)
 
@@ -415,6 +459,7 @@ class PracticeMap:
         self.nav_height = surfaces = array("f", (self.heights[j * self.nx + i]
                                                    for j in range(0, self.ny, 2)
                                                    for i in range(0, self.nx, 2)))
+        self.walk_height = array("d", surfaces)
         self.free = free = bytearray(w * h)
         first_x = max(0, math.ceil((self.left + 2.6 - self.x0) / 2))
         last_x = min(w - 1, math.floor((self.right - 2.6 - self.x0) / 2))
@@ -437,9 +482,10 @@ class PracticeMap:
             x, y = self.x0 + x * 2, self.y0 + y * 2
             ground = surfaces[cell]
             containing = [p for p in candidates if p.top > ground and p.contains(x, y)]
-            surface = self.stack(ground, containing)
+            surface, support = self.stack(ground, containing, with_support=True)
             surfaces[cell] = surface
-            if (surface > ground + 1.5 and any(p.top == surface and not p.bridge for p in containing)
+            self.walk_height[cell] = surface
+            if (surface > ground + 1.5 and support is not None and not support.bridge
                     or any(p.top > surface + 1.2 and p.base < surface + 9 and p.near(x, y, 2.6)
                            for p in candidates)):
                 free[cell] = 0
@@ -452,13 +498,14 @@ class PracticeMap:
             mask = 0
             for i, delta in enumerate(self.offsets[:4]):
                 nxt = cell + delta
-                if free[nxt] and surfaces[nxt] <= level + 2.2:
+                if free[nxt] and f32(surfaces[nxt] - level) <= f32(2.2):
                     mask |= 1 << i
-                    if level <= surfaces[nxt] + 2.2:
+                    if f32(level - surfaces[nxt]) <= f32(2.2):
                         mutual[cell] |= 1 << i
             for i, (dx, dy) in enumerate(NEIGHBORS[4:], 4):
                 nxt = cell + self.offsets[i]
-                if free[nxt] and free[cell + dx] and free[cell + dy * w] and surfaces[nxt] <= level + 3.1:
+                if (free[nxt] and free[cell + dx] and free[cell + dy * w]
+                        and f32(surfaces[nxt] - level) <= f32(3.1)):
                     mask |= 1 << i
             steps[cell] = mask
         self.clearance = clearance = bytearray(20 if passed else 0 for passed in free)
@@ -555,7 +602,7 @@ class PracticeMap:
         for s in range(1, count + 1):
             nxt = cell(x + dx * s, y + dy * s)
             if nxt != previous:
-                if not free[nxt] or heights[nxt] > heights[previous] + 3.1:
+                if not free[nxt] or f32(heights[nxt] - heights[previous]) > f32(3.1):
                     return False
                 previous = nxt
         return True
@@ -601,7 +648,7 @@ class Route:
     def heuristic(self, cell):
         y, x = divmod(cell, self.arena.w)
         dx, dy = abs(x - self.gx), abs(y - self.gy)
-        return f32(1.15 * 2 * (max(dx, dy) + 0.4142 * min(dx, dy)))
+        return f32((max(dx, dy) + 0.4142 * min(dx, dy)) * 2 * 1.15)
 
     def push(self, key, cell):
         heap = self.heap
@@ -655,7 +702,11 @@ class Route:
                 nxt = cell + delta
                 if nxt in closed:
                     continue
-                cost = f32(base + (2.8284 if diagonal else 2) * (1 + 0.15 * max(0, 4 - clearance[nxt])))
+                step = f32(2.8284) if diagonal else 2.0
+                if clearance[nxt] < 4:
+                    factor = f32(1 + f32((4 - clearance[nxt]) * f32(0.15)))
+                    step = f32(step * factor)
+                cost = f32(base + step)
                 if cost < costs.get(nxt, INF):
                     costs[nxt] = cost
                     self.parent[nxt] = cell
@@ -773,9 +824,9 @@ class Practice:
         self.upgrades = {upgrade["id"]: upgrade.get("name")
                          for raw in seq(config.get("upgrades"))
                          if isinstance((upgrade := obj(raw)).get("id"), str)}
-        self.map_dir = obj(hello.get("map")).get("dir")
         self.arena = None
         self.enemies, self.drones = {}, {}
+        self.current_enemies = []
         self.items = {key: {} for key in ("pickups", "cubes", "crates")}
         self.zone = Zone()
         self.kills = self.deficit_ticks = 0
@@ -802,12 +853,26 @@ class Practice:
         self.mode = "start"
         self.work_limits = 0
 
-    def load_map(self):
-        directory = self.map_dir if isinstance(self.map_dir, str) and len(self.map_dir) < 2048 else None
-        try:
-            self.arena = PracticeMap(directory)
-        except (ValueError, TypeError, LookupError, ArithmeticError, AttributeError):
-            self.arena = PracticeMap(world=FLAT_WORLD)
+    def load_map(self, *, world_json=None, terrain_bytes=None):
+        """Build geometry from the arena bytes supplied by the entry point."""
+        if world_json is not None and terrain_bytes is not None:
+            try:
+                world = json.loads(world_json)
+                samples = array("h", terrain_bytes)
+                if sys.byteorder != "little":
+                    samples.byteswap()
+                terrain = world["terrain"]
+                if (terrain["step"] != 1 or not 2 <= terrain["nx"] <= 2048
+                        or not 2 <= terrain["ny"] <= 2048
+                        or len(samples) != terrain["nx"] * terrain["ny"]):
+                    raise ValueError("Invalid terrain grid")
+                unit_metres = f32(0.01)
+                heights = array("f", (h * unit_metres for h in samples))
+                self.arena = PracticeMap(world=world, heights=heights)
+                return
+            except (ValueError, TypeError, LookupError, ArithmeticError, AttributeError):
+                pass
+        self.arena = PracticeMap()
 
     def prepare(self, obs):
         me = obj(obs.get("self"))
@@ -868,8 +933,8 @@ class Practice:
         clear = arena.clear_ray
         for table in (self.enemies, self.drones):
             for track in table.values():
-                track.fresh = track.engaged = False
-                if table is self.enemies:
+                track.fresh, track.engaged = track.seen == now, False
+                if table is self.enemies and not track.fresh:
                     track.clear = False
         base_radius = number(self.mech.get("radius"), 2.5)
         base_height = number(self.mech.get("height"), 9)
@@ -877,6 +942,7 @@ class Practice:
         npc_radius = number(self.npc.get("radius"), 1.8)
         npc_height = number(self.npc.get("height"), 3.5)
         size_per_cube = number(self.cube_config.get("size_per_cube"), 0.05)
+        self.current_enemies = []
         for item in seq(obs.get("mechs")):
             raw = obj(item)
             kind = raw.get("kind")
@@ -902,6 +968,8 @@ class Practice:
                                  vel, aim, cubes, tuple(seq(raw.get("weapons"))), raw.get("charging") is True,
                                  previous.hit if previous else -100, closing, span, radius, height, eye, visible,
                                  face_error=abs(angle(aim[0] - math.atan2(-dy, -dx))), midpoint=midpoint)
+            if kind == "mech":
+                self.current_enemies.append(table[ident])
         for table, expiry in ((self.enemies, 20), (self.drones, 120)):
             for ident in [ident for ident, track in table.items() if now - track.seen > expiry]:
                 del table[ident]
@@ -1004,7 +1072,7 @@ class Practice:
             losing = nearby >= 2 and hp < 0.55 or nearby >= 3 and hp < 0.80
             if shot:
                 theirs = shot.hp / max(1, shot.max_hp)
-                losing |= hp < 0.35 and theirs - hp > 0.10
+                losing |= hp < 0.35 and theirs > hp + 0.10
                 if theirs < 0.25 and hp > 0.20 and nearby <= 2:
                     losing = False
             if losing:
@@ -1012,17 +1080,16 @@ class Practice:
             self.retreat = self.losing > 0 and now - self.losing < 1.5
 
     def pick(self, obs, action):
-        choices = seq(obj(obs.get("offer")).get("choices"))[:3]
+        choices = seq(obj(obs.get("offer")).get("choices"))
         if choices:
             ranking = (SQUAD_UPGRADES if self.squad else OPEN_UPGRADES) + END_UPGRADES
             rank = {name: i for i, name in enumerate(ranking)}
-            names = (self.upgrades.get(ident) if isinstance(ident := obj(choice).get("id"), str) else None
-                     for choice in choices)
-            action["pick"] = min(enumerate(names), key=lambda pair: rank.get(pair[1], INF))[0]
+            ids = (ident if isinstance(ident := obj(choice).get("id"), str) else None for choice in choices)
+            action["pick"] = min(enumerate(ids), key=lambda pair: rank.get(pair[1], INF))[0]
 
     def wants(self, kind):
         if kind == "gun":
-            return bool(self.raw_slots) and self.raw_slots[0] is None and not self.gun
+            return bool(self.raw_slots) and self.raw_slots[0] is None
         if not isinstance(kind, str) or kind in ("mortar", "gun"):
             return False
         secondary = self.slots[1]
@@ -1039,7 +1106,7 @@ class Practice:
             if distance(self.pos, pos) > reach or abs(self.pos[2] - pos[2]) > 3.6:
                 continue
             secondary = self.slots[1]
-            if secondary and secondary.kind == "laser" and secondary.charge > 0:
+            if all(self.slots) and secondary.kind == "laser" and secondary.charge > 0:
                 break
             ident = number(raw.get("id"))
             if ident >= 0 and ident == int(ident):
@@ -1114,7 +1181,7 @@ class Practice:
             return ZERO
         if arena.above_obstacle(pos) or span < 45 and arena.walkable(pos, goal):
             return direct
-        if (self.route_goal is None or self.now - self.route_at > 2.5
+        if (self.route_goal is None or not self.path and self.search is None or self.now - self.route_at > 2.5
                 or distance(self.route_goal, goal) > 5):
             start, end = arena.snap(pos), arena.snap(goal)
             self.route_goal, self.route_at = goal, self.now
@@ -1186,6 +1253,7 @@ class Practice:
 
     def escape(self):
         arena, pos = self.arena, self.pos
+        jump = False
         if self.grounded:
             self.escape_jumping = False
             start = arena.snap(pos)
@@ -1200,17 +1268,18 @@ class Practice:
             launch, _ = self.escape_plan
             if distance(pos, launch) > 2.5:
                 return self.travel(launch), False, False
-            self.escape_jumping = self.energy >= min(70, 0.7 * self.max_energy)
-            return ZERO, False, self.escape_jumping
+            if self.energy < min(70, 0.7 * self.max_energy):
+                return ZERO, False, False
+            self.escape_jumping = jump = True
         if not self.escape_jumping or self.escape_plan is None:
             return None
         land = self.escape_plan[1]
         span = distance(pos, land)
         if span < 1.5:
-            return ZERO, False, False
+            return ZERO, False, jump
         move = unit(pos, land)
         level = max(arena.surface(*offset(pos, move, n), decks=False) for n in range(int(min(30, span)) + 1))
-        return move, pos[2] < level + 2.5 and self.energy > 1, False
+        return move, pos[2] < level + 2.5 and self.energy > 1, jump
 
     def cover(self, threats):
         arena, pos = self.arena, self.pos
@@ -1223,18 +1292,32 @@ class Practice:
             threats = sorted(threats, key=lambda row: row[0])[:4]
         eyes = [eye for _, eye in threats]
         clear = self.movement_ray
+        levels = getattr(arena, "walk_height", None)
         # Leave room for the combat sampler if this search cannot find cover.
-        cover_deadline = min(self.work_deadline, time.perf_counter() + 0.0018)
+        cover_deadline = min(self.work_deadline, time.perf_counter() + 0.0028)
 
-        def covered(point):
+        def covered(point, level=None):
             x, y = point
-            z = arena.surface(x, y)
+            z = arena.surface(x, y) if level is None else level
             full, half = (x, y, z + self.height), (x, y, z + self.height * 0.5)
-            return not any(clear(eye, full) or clear(eye, half) for eye in eyes)
+            for eye in eyes:
+                if self.reached_work_limit(1, cover_deadline):
+                    return None
+                if clear(eye, full):
+                    return False
+                if self.reached_work_limit(1, cover_deadline):
+                    return None
+                if clear(eye, half):
+                    return False
+            return True
 
-        if self.zone.penalty(pos) == 0 and covered(pos[:2]):
-            self.cover_goal, self.cover_at = pos[:2], self.now
-            return ZERO
+        if self.zone.penalty(pos) == 0:
+            hidden = covered(pos[:2])
+            if hidden is None:
+                return None
+            if hidden:
+                self.cover_goal, self.cover_at = pos[:2], self.now
+                return ZERO
         start = arena.snap(pos)
         if start is None:
             return None
@@ -1246,14 +1329,18 @@ class Practice:
                 break
             y, x = divmod(cell, arena.w)
             if n and (x + y) % 2 == 0:
-                if checked >= 350 or self.reached_work_limit(32, cover_deadline):
+                if checked >= 350 or self.reached_work_limit(2 * len(eyes), cover_deadline):
                     break
                 checked += 1
                 point = arena.point(cell)
                 close = min(80, min(distance(point, eye) for eye in eyes))
                 value = 2 * n + self.zone.penalty(point) - 0.25 * close
-                if value < score and covered(point):
-                    best, score = point, value
+                if value < score:
+                    hidden = covered(point, levels[cell] if levels is not None else None)
+                    if hidden is None:
+                        break
+                    if hidden:
+                        best, score = point, value
             for delta, _ in arena.step_offsets[arena.steps[cell]]:
                 nxt = cell + delta
                 if nxt not in seen:
@@ -1295,7 +1382,8 @@ class Practice:
                        and d <= laser.stat("range", 280) - 5)
         if self.squad and (laser or lightning):
             return 1
-        if not self.squad and not laser_ready and foe.fresh and foe.charging and foe.face_error < 0.3:
+        if not self.squad and not laser_ready and any(
+                enemy.fresh and enemy.charging and enemy.face_error < 0.3 for enemy in self.awareness):
             return -1.6
         if (laser_ready or gun and gun.ammo > 0 and gun.reload <= 0.25 and d <= gun.stat("range", 230) - 10
                 or lightning and d <= lightning.stat("range", 45) + 6
@@ -1341,9 +1429,8 @@ class Practice:
         def loses(score, i):
             return score < best_score or score == best_score and i >= best_index
 
-        ray_reserve = 1 + len(threat_eyes)
         for upper, i, score, direction, point, span, probe in candidates:
-            if loses(upper, i) or best_index < INF and self.reached_work_limit(ray_reserve + 8 * probe):
+            if loses(upper, i) or self.reached_work_limit(1):
                 break
             z = arena.surface(*point)
             sightline = clear((*point, z + self.muzzle_height), foe.midpoint)
@@ -1356,21 +1443,34 @@ class Practice:
             if loses(score + ceiling, i):
                 continue
             body = (*point, z + 0.6 * self.height)
+            cut = False
             for eye in threat_eyes:
-                if distance(point, eye) <= 170 and clear(eye, body):
+                if distance(point, eye) > 170:
+                    continue
+                if self.reached_work_limit(1):
+                    cut = True
+                    break
+                if clear(eye, body):
                     score -= 30
                     if loses(score + ceiling, i):
                         break
+            if cut:
+                break
             if loses(score + ceiling, i):
                 continue
             if extra:
                 for direction2 in HEADINGS[::2]:
                     alternative = offset(point, direction2, 7)
                     if arena.free[arena.cell(*alternative)]:
+                        if self.reached_work_limit(1):
+                            cut = True
+                            break
                         elevation = arena.surface(*alternative) + self.muzzle_height
                         if clear((*alternative, elevation), foe.midpoint) != sightline:
                             score += 8
                             break
+            if cut:
+                break
             if not loses(score, i):
                 best, best_score, best_index = direction, score, i
         if turn_next:
@@ -1391,9 +1491,10 @@ class Practice:
             vx, vy, vz = velocity
             dx, dy = vx * 0.05, vy * 0.05
             # A shell farther away even after the longest eligible flight cannot hit us.
-            if distance(origin, pos) > 2.5 * math.hypot(vx, vy) + reach:
+            if distance(origin, pos) > 2.55 * math.hypot(vx, vy) + reach:
                 continue
-            for step in range(50):
+            # The source's accumulated pre-step clock admits the 51st update.
+            for step in range(51):
                 x, y, z = x + dx, y + dy, z + vz * 0.05
                 vz -= gravity * 0.05
                 if not arena.solid((x, y, z)):
@@ -1425,8 +1526,8 @@ class Practice:
                 x -= sign * vy / xy
                 y += sign * vx / xy
         laser = False
-        for foe in self.awareness:
-            if foe.fresh and foe.charging and foe.face_error <= 0.15:
+        for foe in self.current_enemies:
+            if foe.charging and foe.face_error <= 0.15:
                 perpendicular = bearing(foe.pos, self.pos) + self.strafe_side * math.pi / 2
                 x += 1.5 * math.cos(perpendicular)
                 y += 1.5 * math.sin(perpendicular)
@@ -1436,7 +1537,7 @@ class Practice:
             x, y = 0.4 * move[0] + 0.9 * x / norm, 0.4 * move[1] + 0.9 * y / norm
             cap = max(1, math.hypot(x, y))
             move = x / cap, y / cap
-        return move, boost or laser and self.energy > 25
+        return move, boost or norm > 0.01 and laser and self.energy > 25
 
     def home_point(self):
         now, zone, arena = self.now, self.zone.next, self.arena
@@ -1564,7 +1665,7 @@ class Practice:
             if now - drone.seen > 0.5 or not drone.clear or drone.dist > 150:
                 continue
             value = abs(angle(bearing(self.pos, drone.pos) - self.drone_bearing))
-            if value < 0.7 and now - drone.hit < 3:
+            if now - drone.hit < 3:
                 value = 0
             if value < score:
                 best, score = drone, value
@@ -1633,7 +1734,7 @@ class Practice:
         can_gun = False
         if target:
             origin = (self.muzzle[0] + self.vel[0] * 0.075, self.muzzle[1] + self.vel[1] * 0.075, self.muzzle[2])
-            d = target.dist
+            d = distance(self.pos, target.pos)
             if target.kind == "mech":
                 point = target.midpoint
                 if not self.arena.clear_ray(origin, point):

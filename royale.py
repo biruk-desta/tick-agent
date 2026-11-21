@@ -9,6 +9,7 @@ import mechfight as mf
 import example_bot as eb
 import duel_bot
 import math
+from pathlib import Path
 import time
 from typing import NamedTuple
 
@@ -1462,7 +1463,17 @@ class Royale:
 
     def load_map(self):
         if self.practice2 is not None:
-            self.practice2.load_map()
+            directory = self.practice.map_dir
+            if not isinstance(directory, str) or len(directory) >= 2048:
+                directory = None
+            root = Path(directory or "/arena") / "v2"
+            try:
+                world_json = eb.read_map_file(root / "world.json")
+                terrain_bytes = eb.read_map_file(root / "terrain.i16")
+            except (OSError, ValueError):
+                self.practice2.load_map()
+            else:
+                self.practice2.load_map(world_json=world_json, terrain_bytes=terrain_bytes)
         self.practice.load_map()
         self.ffa.arena = self.practice.arena
         return True
