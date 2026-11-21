@@ -726,8 +726,8 @@ def _practice_lines(fd):
         yield bytes(pending), time.perf_counter()
 
 
-def _practice_decision(bot, obs, tick):
-    return _encode({**bot.act(obs), "tick": tick})
+def _practice_decision(bot, obs, tick, observed):
+    return _encode({**bot.act(obs, observed=observed), "tick": tick})
 
 
 def _reject_constant(value):
@@ -761,7 +761,7 @@ def run_practice(make_bot):
         else:
             remaining = deadline - time.perf_counter() - PRACTICE_WRITE_RESERVE
             if remaining > 0:
-                payload = _watched(remaining, _practice_decision, bot, obs, tick)
+                payload = _watched(remaining, _practice_decision, bot, obs, tick, observed)
             if payload is None or len(payload) > frame_limit:
                 bot.practice_fallbacks += 1
                 log(f"practice2 fallback {bot.practice_fallbacks}: transport guard")

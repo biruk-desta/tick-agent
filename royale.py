@@ -17,7 +17,7 @@ eb.PLAN_BUDGET_S = 0.010
 eb.ROUTE_SLICE_S = 0.004
 from example_bot import obj, seq, number, vec, distance, bearing, angle, limit, raised
 
-SEED = 6                    # variant r2 branch marker; the practice RNG uses hello.seed
+SEED = 6                    # variant r3 branch marker; the practice RNG uses hello.seed
 P_DRIVER = 2                # 1 = legacy practice, 2 = practice2
 FORCE_MODE = None           # None = detect; "practice" or "free-for-all" pins the policy
 GUARDED_OPENER = True       # squad play fights only mechs that attack or close on us
@@ -1469,10 +1469,10 @@ class Royale:
         self.ffa.arena = self.practice.arena
         return True
 
-    def act(self, obs):
+    def act(self, obs, *, observed=None):
         if self.practice2 is not None:
             try:
-                return self.practice2.act(obs)
+                return self.practice2.act(obs, observed)
             except Exception as error:
                 self.practice_fallbacks += 1
                 mf.log(f"practice2 fallback {self.practice_fallbacks}: {type(error).__name__}")

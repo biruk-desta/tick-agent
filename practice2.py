@@ -9,16 +9,26 @@ import math
 from pathlib import Path
 from struct import Struct
 import sys
+from time import perf_counter
 
 from example_bot import bearing, distance, limit, obj, raised, seq
+
+try:
+    import _practice_fast as fast
+except ImportError:
+    fast = None
 
 
 ZERO = (0.0, 0.0)
 ZERO3 = (0.0, 0.0, 0.0)
 INF = math.inf
+GUARD_SECONDS = 0.010
+NATIVE_ROUTE_SECONDS = 0.008
+PYTHON_ROUTE_SECONDS = 0.0037
 HEADINGS = tuple((math.cos(i * math.pi / 8), math.sin(i * math.pi / 8)) for i in range(16))
 EXPOSURE_HEADINGS = tuple((math.cos(i * math.pi / 12), math.sin(i * math.pi / 12)) for i in range(24))
 FIGHT_RING = tuple((direction, 6) for direction in HEADINGS)
+PEEK_HEADINGS = HEADINGS[::2]
 SQUAD_STEPS = ((ZERO, 0),) + FIGHT_RING
 OPEN_STEPS = SQUAD_STEPS + tuple((direction, 12) for direction in HEADINGS)
 NEIGHBORS = ((1, 0), (-1, 0), (0, 1), (0, -1), (1, 1), (1, -1), (-1, 1), (-1, -1))
@@ -129,6 +139,7 @@ CM_TO_M = f32(0.01)
 ORTH_RISE, DIAG_RISE = f32(2.2), f32(3.1)
 EDGE_COST = tuple(tuple(f32(step * f32(1 + f32(f32(0.15) * max(0, 4 - clearance))))
                         for clearance in range(21)) for step in (2, f32(2 * f32(1.4142))))
+LANDING_DISTANCES = array("d", (math.hypot(2 * x, 2 * y) for y in range(21) for x in range(21)))
 
 
 def map_order(table):
@@ -309,6 +320,40 @@ class PracticeMap:
                               for j in range(block_rows) for i in range(width)]
         self.build_raster()
         self.build_grid()
+        self.ray_cache = {}
+        self.routes = {}
+        self.snaps = {}
+        bounded = all(-1e8 < value < 1e8 for value in
+                      (self.x0, self.y0, self.bx, self.by, self.right, self.top))
+        self.native = self.load_native() if fast is not None and bounded else None
+        # On integer grids the landing offsets are exact multiples of 2 m.
+        self.native_escape = self.native is not None and all(
+            value == int(value) for value in (self.x0, self.y0))
+
+    def load_native(self):
+        prisms, edges = array("d"), array("d")
+        edge_starts, bucket_starts, bucket_prisms = array("i", [0]), array("i", [0]), array("i")
+        prism_ids = {}
+        for index, prism in enumerate(self.prisms):
+            prism_ids[prism] = index
+            prisms.extend((prism.base, prism.top, *prism.bounds))
+            for edge in prism.edges:
+                edges.extend(edge)
+            edge_starts.append(len(edges) // 4)
+        for j in range(self.bucket_h):
+            for i in range(self.bucket_w):
+                bucket_prisms.extend(prism_ids[p] for p in self.buckets.get((i, j), ()))
+                bucket_starts.append(len(bucket_prisms))
+        heuristics = array("f", (value for row in self.heuristic_rows for value in row))
+        costs = array("f", EDGE_COST[0] + EDGE_COST[1])
+        return fast.load_arena(
+            (self.steps, self.clearance, heuristics, costs, self.heights, array("d", self.block_max),
+             prisms, edges, edge_starts, bucket_starts, bucket_prisms,
+             self.landing_cell if self.landing_cell is not None else array("i"), LANDING_DISTANCES),
+            (self.w, self.nx, self.ny, self.block_width, self.bucket_w, self.bucket_h),
+            (self.x0, self.y0, self.bx, self.by, self.terrain_top, self.terrain_bottom,
+             self.solid_top if self.buckets else -INF),
+        )
 
     def inside(self, x, y):
         return self.left < x < self.right and self.bottom < y < self.top
@@ -355,6 +400,27 @@ class PracticeMap:
                                           for p in self.local_prisms(x, y))
 
     def clear_ray(self, start, end):
+        # The segment is directed: the endpoint and stepping rules differ
+        # from their reverse. Coordinates are exact and terrain is immutable.
+        key = tuple(start), tuple(end)
+        cached = self.ray_cache.get(key)
+        if cached is not None:
+            return cached
+        result = None
+        if self.native is not None:
+            step = 0.0
+            if min(start[2], end[2]) <= self.terrain_top and self.terrain_top != self.terrain_bottom:
+                span = math.hypot(end[0] - start[0], end[1] - start[1])
+                if span > 1e-9:
+                    step = 0.5 / span
+            result = fast.clear_ray(self.native, key[0], key[1], step)
+        if result is None:
+            result = self.clear_ray_python(start, end)
+        if len(self.ray_cache) < 4096:
+            self.ray_cache[key] = result
+        return result
+
+    def clear_ray_python(self, start, end):
         x, y, z = start
         ex, ey, ez = end
         dx, dy, dz = ex - x, ey - y, ez - z
@@ -584,6 +650,13 @@ class PracticeMap:
         cell = self.cell(*pos[:2])
         if self.free[cell]:
             return cell
+        if cell not in self.snaps:
+            if len(self.snaps) >= 1024:
+                del self.snaps[next(iter(self.snaps))]
+            self.snaps[cell] = self.snap_blocked(cell)
+        return self.snaps[cell]
+
+    def snap_blocked(self, cell):
         y, x = divmod(cell, self.w)
         for ring in range(1, 21):
             best, best_score = None, INF
@@ -663,11 +736,25 @@ class Route:
 
     def __init__(self, arena, start, goal):
         self.arena, self.start, self.goal = arena, start, goal
-        self.parent = {start: None}
-        self.best = start
-        self.pops = 0
+        self.result = None
+        if arena.native is None:
+            self.slices = self.search_python()
+            self.native = None
+        else:
+            sy, sx = divmod(start, arena.w)
+            gy, gx = divmod(goal, arena.w)
+            heuristic = arena.heuristic_rows[abs(sy - gy)][abs(sx - gx)]
+            self.native = fast.start_route(start, goal, arena.w, len(arena.steps), heuristic)
 
-    def advance(self):
+    def advance(self, deadline=INF):
+        while self.result is None and perf_counter() < deadline:
+            cells = (fast.advance_route(self.arena.native, self.native)
+                     if self.native is not None else next(self.slices))
+            if cells is not None:
+                self.result = tuple(map(self.arena.point, cells))
+        return self.result is not None
+
+    def search_python(self):
         arena, goal, start = self.arena, self.goal, self.start
         steps, offsets, clearance = arena.steps, arena.step_offsets, arena.clearance
         width = arena.w
@@ -678,11 +765,13 @@ class Route:
         best, best_h = start, heuristics[y][xdelta[x]]
         heap = [(best_h, start, best_h)]
         costs = {start: 0.0}
-        parent = self.parent
+        parent = {start: None}
         closed = bytearray(len(steps))
         pack, unpack = FLOAT32.pack, FLOAT32.unpack
         pops = 0
         while heap and pops < 22000:
+            if pops and pops % 128 == 0:
+                yield None
             _, cell, heur = heap[0]
             last = heap.pop()
             count = len(heap)
@@ -735,14 +824,14 @@ class Route:
                         heap[idx] = previous
                         idx = ancestor
                     heap[idx] = node
-        self.best, self.pops = best, pops
+        path, cell = [], best
+        while cell is not None:
+            path.append(cell)
+            cell = parent[cell]
+        yield path[::-1]
 
     def path(self):
-        path, cell = [], self.best
-        while cell is not None:
-            path.append(self.arena.point(cell))
-            cell = self.parent[cell]
-        return path[::-1]
+        return self.result
 
 
 @dataclass(slots=True)
@@ -869,6 +958,11 @@ class Practice:
         self.route_goal = None
         self.route_at = -INF
         self.path, self.waypoint = (), 0
+        self.pending_route, self.pending_goal = None, None
+        self.route_slices = 0
+        self.deadline = self.route_deadline = INF
+        self.guard_fired = False
+        self.guard_firings = 0
         self.escape_plan = None
         self.escape_at = -INF
         self.escape_jumping = False
@@ -1169,15 +1263,36 @@ class Practice:
             return ZERO
         if arena.above_obstacle(pos) or span < 45 and arena.walkable(pos, goal):
             return direct
-        if (not self.path or self.now - self.route_at > 2.5
+        if (self.pending_route is not None or not self.path or self.now - self.route_at > 2.5
                 or distance(self.route_goal, goal) > 5):
             start, end = arena.snap(pos), arena.snap(goal)
-            self.route_goal, self.route_at = goal, self.now
-            self.path, self.waypoint = (), 0
-            if start is not None and end is not None:
-                search = Route(arena, start, end)
-                search.advance()
-                self.path = search.path()
+            search = self.pending_route
+            if start is None or end is None:
+                self.path, self.pending_route = (), None
+                return direct
+            if (search is not None and (end != search.goal or distance(self.pending_goal, goal) > 5
+                                        or distance(pos, arena.point(search.start)) > 12)):
+                search = self.pending_route = None
+            key = start, end
+            # A completed search is a function of the two snapped cells and
+            # this immutable grid, including when it reaches the pop cap.
+            path = arena.routes.get(key)
+            if path is None and perf_counter() < self.route_deadline:
+                if search is None:
+                    search = self.pending_route = Route(arena, start, end)
+                    self.pending_goal = goal
+                if search.advance(self.route_deadline):
+                    path = search.path()
+                    if len(arena.routes) >= 128:
+                        del arena.routes[next(iter(arena.routes))]
+                    arena.routes[search.start, end] = path
+            if path is not None:
+                self.path, self.waypoint = path, 0
+                self.route_goal, self.route_at = goal, self.now
+                self.pending_route = None
+            else:
+                self.route_slices += 1
+                self.guard()
         path = self.path
         if not path:
             return direct
@@ -1200,7 +1315,20 @@ class Practice:
         arena = self.arena
         if start is None or arena.landing_cell is None:
             return None
-        queue, seen, pair, score, visits = deque([(start, 0)]), {start}, None, INF, 0
+        cell = fast.escape_cell(arena.native, start) if arena.native_escape else self.escape_cell(start)
+        self.escape_at = self.now
+        if cell < 0:
+            return None
+        launch, land = arena.point(cell), arena.point(arena.landing_cell[cell])
+        if distance(launch, land) > 0.1:
+            beyond = offset(land, unit(launch, land), 5)
+            if arena.inside(*beyond) and arena.main[arena.cell(*beyond)]:
+                land = beyond
+        return launch, land
+
+    def escape_cell(self, start):
+        arena = self.arena
+        queue, seen, best, score, visits = deque([(start, 0)]), {start}, -1, INF, 0
         while queue and visits < 60000:
             cell, n = queue.popleft()
             visits += 1
@@ -1212,18 +1340,13 @@ class Practice:
                 span = distance(launch, land)
                 value = 2 * n + 4 * span
                 if value < score:
-                    if span > 0.1:
-                        beyond = offset(land, unit(launch, land), 5)
-                        if arena.inside(*beyond) and arena.main[arena.cell(*beyond)]:
-                            land = beyond
-                    pair, score = (launch, land), value
+                    best, score = cell, value
             for delta, _ in arena.step_offsets[arena.steps[cell]]:
                 nxt = cell + delta
                 if nxt not in seen:
                     seen.add(nxt)
                     queue.append((nxt, n + 1))
-        self.escape_at = self.now
-        return pair
+        return best
 
     def escape(self):
         arena, pos = self.arena, self.pos
@@ -1288,6 +1411,8 @@ class Practice:
             if n and (x + y) % 2 == 0:
                 if checked >= 350:
                     break
+                if self.guard():
+                    break
                 checked += 1
                 point = arena.point(cell)
                 close = min(80, min(distance(point, eye) for eye in eyes))
@@ -1301,7 +1426,8 @@ class Practice:
                     queue.append((nxt, n + 1))
         if best is None:
             return None
-        self.cover_goal, self.cover_at = best, self.now
+        if not self.guard_fired:
+            self.cover_goal, self.cover_at = best, self.now
         return self.cover_move(best)
 
     def cover_move(self, goal):
@@ -1360,6 +1486,8 @@ class Practice:
         directions = SQUAD_STEPS if self.squad else OPEN_STEPS
         threat_eyes = [eye for ident, eye in self.threat_eyes if ident != foe.id and distance(pos, eye) <= 182]
         for direction, span in directions:
+            if span and self.guard():
+                break
             dot = direction[0] * sx + direction[1] * sy
             point = offset(pos, direction, span)
             cell = arena.cell(*point)
@@ -1386,7 +1514,7 @@ class Practice:
             if score + (8 if extra else 0) - zone + bonus - clearance + strafe + stand <= best_score:
                 continue
             if extra:
-                for direction2 in HEADINGS[::2]:
+                for direction2 in PEEK_HEADINGS:
                     alternative = offset(point, direction2, 7)
                     if arena.free[arena.cell(*alternative)]:
                         elevation = arena.surface(*alternative) + self.muzzle_height
@@ -1416,25 +1544,36 @@ class Practice:
         for kind, origin, velocity in self.projectiles:
             if kind != "mortar":
                 continue
-            x, y, z = origin
-            vx, vy, vz = velocity
-            dx, dy = vx * 0.05, vy * 0.05
-            clock = 0.0
-            while clock < 4:
-                x, y, z = x + dx, y + dy, z + vz * 0.05
-                vz -= gravity * 0.05
-                if not arena.solid((x, y, z)):
-                    clock += 0.05
-                    continue
-                span = distance(pos, (x, y))
-                if clock < 2.5 and span < reach:
-                    away = unit(ZERO, (-vy, vx)) if span < 0.5 else unit((x, y), pos)
-                    for turn in (0, 0.7, -0.7, 1.4, -1.4):
-                        c, s = heading(turn)
-                        move = away[0] * c - away[1] * s, away[0] * s + away[1] * c
-                        if arena.walkable(pos, offset(pos, move, 6)):
-                            return move
-                break
+            if arena.native is not None and gravity < 1e8 and all(-1e8 < v < 1e8 for v in (*origin, *velocity)):
+                impact = fast.shell_impact(arena.native, origin, velocity, gravity)
+            else:
+                impact = self.shell_impact(origin, velocity, gravity)
+            if impact is None:
+                continue
+            span = distance(pos, impact)
+            if not span < reach:
+                continue
+            vx, vy, _ = velocity
+            away = unit(ZERO, (-vy, vx)) if span < 0.5 else unit(impact, pos)
+            for turn in (0, 0.7, -0.7, 1.4, -1.4):
+                c, s = heading(turn)
+                move = away[0] * c - away[1] * s, away[0] * s + away[1] * c
+                if arena.walkable(pos, offset(pos, move, 6)):
+                    return move
+        return None
+
+    def shell_impact(self, origin, velocity, gravity):
+        x, y, z = origin
+        vx, vy, vz = velocity
+        dx, dy = vx * 0.05, vy * 0.05
+        clock = 0.0
+        # An impact at or beyond this clock never enters the dodge sweep.
+        while clock < 2.5:
+            x, y, z = x + dx, y + dy, z + vz * 0.05
+            vz -= gravity * 0.05
+            if self.arena.solid((x, y, z)):
+                return x, y
+            clock += 0.05
         return None
 
     def dodge(self, move, boost):
@@ -1521,6 +1660,8 @@ class Practice:
         if self.retreat and not finish and not self.late:
             if (move := self.cover(self.threat_eyes)) is not None:
                 return "retreat", move, move != ZERO and self.energy > 10, False, None
+            if self.guard_fired:
+                return "retreat", ZERO, False, False, None
             if shot:
                 move = self.fight(shot, self.preferred(shot), 1)
             else:
@@ -1534,11 +1675,14 @@ class Practice:
                      self.pos[2] + number(self.mech.get("eye_height")))
             if (move := self.cover([(None, sight), *self.threat_eyes])) is not None:
                 return "hide", move, move != ZERO and self.energy > 30, False, None
+            if self.guard_fired:
+                return "hide", ZERO, False, False, None
         if (foe := shot or blocked) is not None:
             close = self.squad and foe.hp < 0.38 * foe.max_hp and self.hp_share > 0.42 and self.crowd <= 2
             sight = self.sight_preference(foe)
             move = self.fight(foe, self.preferred(foe, close), sight)
-            if self.squad and (cube := self.nearest_cube(70 if self.hp_share > 0.50 else 70 * 0.57)):
+            if (self.squad and not self.guard_fired
+                    and (cube := self.nearest_cube(70 if self.hp_share > 0.50 else 70 * 0.57))):
                 move = self.travel(cube.pos)
             return "fight", move, bool(self.lightning and foe.dist > 50 and self.energy > 55 and sight > 0), False, None
         if self.zone_span > 2 and self.zone_arrival + 14 >= self.zone_deadline:
@@ -1734,9 +1878,21 @@ class Practice:
             damage *= 1 + laser.stat("cookoff")
         return 0.80 * damage >= shot.hp
 
-    def act(self, obs):
+    def guard(self):
+        if not self.guard_fired and perf_counter() >= self.deadline:
+            self.guard_fired = True
+            self.guard_firings += 1
+        return self.guard_fired
+
+    def act(self, obs, observed=None):
         if self.arena is None:
             return {"aim": self.last_aim}
+        started = perf_counter() if observed is None else observed
+        self.deadline = started + GUARD_SECONDS
+        route_budget = NATIVE_ROUTE_SECONDS if self.arena.native is not None else PYTHON_ROUTE_SECONDS
+        self.route_deadline = started + route_budget
+        self.guard_fired = False
+        self.arena.ray_cache.clear()
         self.prepare(obs)
         self.refresh(obs)
         shot, blocked = self.targets()
