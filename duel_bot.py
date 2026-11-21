@@ -448,6 +448,8 @@ class DuelBot(Bot):
             boosting = action.pop("boost", False)
             self.combat(obs, pos, weapons, actual, stats, contacts, True, urgent, False, energy, 1.0, zone,
                         action, until + 0.002, terminal_burn, False, bool(hazards))
+            if foe is not None and foe.kind == "mech":
+                self.gun_and_arc(action, weapons, pos, actual, stats, foe, energy)
             charging = any(f and w.get("kind") == "laser" for f, w in zip(action.get("fire", ()), weapons))
             action["boost"] = bool(boosting) and not charging
         return action
@@ -486,6 +488,34 @@ class DuelBot(Bot):
             reach = {"near": 40, "mid": 100}.get(sound.get("dist"), 180)
             self.hunt_point = (now, (pos[0] + reach * math.cos(b), pos[1] + reach * math.sin(b), pos[2]))
             return
+
+    def gun_and_arc(self, action, weapons, pos, actual, stats, foe, energy):
+        """Inside lightning range, aim at the gun's lead point so the gun and the arc fire on the
+        same tick (the arc's 30-degree cone tolerates the small lead)."""
+        light = next((i for i, w in enumerate(weapons) if w.get("kind") == "lightning"), None)
+        gun = next((i for i, w in enumerate(weapons) if w.get("kind") == "gun"), None)
+        if light is None or foe.dist > self.light_range * 0.97:
+            return
+        fire = list(action.get("fire") or [False, False])
+        while len(fire) < 2:
+            fire.append(False)
+        lw = weapons[light]
+        cone = math.radians(number(obj(lw.get("stats")).get("cone_deg"), 30))
+        cost = number(obj(lw.get("stats")).get("energy"), 3)
+        yaw_err = abs(angle(bearing(pos, foe.pos) - actual[0]))
+        fire[light] = foe.clear and yaw_err < cone * 0.45 and energy >= cost + 1 and number(lw.get("cooldown")) <= self.dt + 0.025
+        if gun is not None:
+            gw = weapons[gun]
+            muzzle = self.phys("muzzle_height", 7, stats)
+            bounds = self.phys("min_pitch", -0.7, stats), self.phys("max_pitch", 1.3, stats)
+            plan = self.aim_for(gw, foe, pos, muzzle, bounds) if gw.get("kind") else None
+            if plan is not None:
+                yaw, pitch, tol, vert = plan
+                action["aim"] = [yaw, pitch]
+                ready = number(gw.get("reload")) <= 0 and number(gw.get("ammo"), 1) > 0
+                allow = self.phys("turn_rate", 4, stats) * self.physics_dt * 0.52
+                fire[gun] = ready and abs(angle(yaw - actual[0])) <= tol + allow and abs(pitch - actual[1]) <= vert + allow
+        action["fire"] = fire
 
     def resource_goal(self, obs, pos, zone, hunters, kinds, weapons):
         """Cubes within 90 m and wanted weapons, priced by distance plus danger from mechs near
