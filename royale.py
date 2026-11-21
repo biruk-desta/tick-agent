@@ -17,7 +17,8 @@ eb.PLAN_BUDGET_S = 0.010
 eb.ROUTE_SLICE_S = 0.004
 from example_bot import obj, seq, number, vec, distance, bearing, angle, limit, raised
 
-SEED = 6                    # the only source of randomness; a different value is a different draw
+SEED = 6                    # practice2 random stream seed
+P_DRIVER = 2                # 1 = legacy practice, 2 = practice2
 FORCE_MODE = None           # None = detect; "practice" or "free-for-all" pins the policy
 GUARDED_OPENER = True       # squad play fights only mechs that attack or close on us
 PAUSE_MED_MS = 8.0
@@ -1439,21 +1440,29 @@ class Selective(eb.Bot):
 
 class Royale:
     def __init__(self, hello):
-        duel_bot.SEED_SALT = SEED
+        # Both legacy practice and Selective's fallback keep the v6c draw.
+        duel_bot.SEED_SALT = 6
         self.practice = duel_bot.DuelBot(hello)
         self.practice.guarded = GUARDED_OPENER
         self.ffa = Selective(hello)
         self.detector = Detector(hello)
         self.mode = FORCE_MODE or "practice"
         self.first_ffa = None
+        self.practice2 = None
+        self.practice_fallbacks = 0
+        if P_DRIVER == 2 and self.mode == "practice":
+            from practice2 import Practice
+            self.practice2 = Practice(hello, SEED)
 
     def __getattr__(self, name):
         # Tools and tests that inspect the policy see the active one.
-        if name in ("practice", "ffa", "detector", "mode", "first_ffa"):
+        if name in ("practice", "practice2", "ffa", "detector", "mode", "first_ffa"):
             raise AttributeError(name)
-        return getattr(self.ffa if self.mode == "free-for-all" else self.practice, name)
+        return getattr(self.ffa if self.mode == "free-for-all" else (self.practice2 or self.practice), name)
 
     def load_map(self):
+        if self.practice2 is not None:
+            self.practice2.load_map()
         self.practice.load_map()
         self.ffa.arena = self.practice.arena
         return True
@@ -1474,8 +1483,18 @@ class Royale:
         if self.mode == "free-for-all":
             return self.ffa.act(obs)
         self.ffa.record(obs, vec(obj(obs.get("self")).get("pos"), 3), now)
+        if self.practice2 is not None:
+            try:
+                return self.practice2.act(obs)
+            except Exception as error:
+                self.practice_fallbacks += 1
+                mf.log(f"practice2 fallback {self.practice_fallbacks}: {type(error).__name__}")
+                try:
+                    return self.practice.act(obs)
+                except Exception:
+                    return {"aim": self.practice2.last_aim}
         return self.practice.act(obs)
 
 
 if __name__ == "__main__":
-    mf.run(Royale, pause_show=PAUSE_SHOW)
+    mf.run(Royale, pause_show=PAUSE_SHOW, practice_wire=P_DRIVER == 2 and FORCE_MODE != "free-for-all")

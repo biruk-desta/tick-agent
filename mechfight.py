@@ -27,6 +27,7 @@ import math
 import os
 import select
 import signal
+import re
 import statistics
 import sys
 import time
@@ -563,7 +564,7 @@ def _decision(bot, obs, tick, pause_show):
     return None
 
 
-def run(make_bot: Any, *, pause_show: bool = False) -> None:
+def run(make_bot: Any, *, pause_show: bool = False, practice_wire: bool = False) -> None:
     """Run a bot until end or EOF, with a watchdog around each decision."""
     global pause_ms
     pause_ms = (None, None)
@@ -583,12 +584,20 @@ def run(make_bot: Any, *, pause_show: bool = False) -> None:
     latest = None
     batch_start = None
     frames = 0
+    default_observation = False
     for raw, received in _lines(sys.stdin.fileno()):
         if raw is not None:
             try:
                 msg = json.loads(raw)
             except (ValueError, RecursionError):
                 msg = None
+                if (practice_wire and (bot is None or bot.mode == "practice")
+                        and re.search(rb'"type"\s*:\s*"obs"', raw)):
+                    match = re.search(rb'"tick"\s*:\s*(-?\d{1,16})(?![\d.])', raw)
+                    if latest is None:
+                        batch_start = received
+                    latest = {"tick": int(match[1])} if match else {}
+                    default_observation = True
             if isinstance(msg, dict):
                 kind = msg.get("type")
                 if kind == "hello" and not handshaken:
@@ -611,6 +620,7 @@ def run(make_bot: Any, *, pause_show: bool = False) -> None:
                         batch_start = received
                     observations += 1
                     latest = msg
+                    default_observation = practice_wire and bot is None
                 elif kind == "end":
                     return
         if latest is None:
@@ -643,9 +653,12 @@ def run(make_bot: Any, *, pause_show: bool = False) -> None:
         last_tick = tick
         remaining = deadline - WRITE_RESERVE_S - time.perf_counter()
         payload = (_watched(remaining, _decision, bot, obs, tick, pause_show)
-                   if bot is not None and remaining > 0 else None)
+                   if bot is not None and remaining > 0 and not default_observation else None)
         if payload is None or len(payload) > frame_limit:
-            payload = _encode_action(_fallback(obs, tick), obs, pause_show)
+            if default_observation:
+                payload = _encode({"tick": tick})
+            else:
+                payload = _encode_action(_fallback(obs, tick), obs, pause_show)
         sent = _send(stdout, payload, deadline)
         last_sent = sent if valid_tick else None
 
