@@ -1,4 +1,4 @@
-"""Practice and free-for-all policies for mechfight/1."""
+
 from array import array
 from dataclasses import dataclass
 import heapq
@@ -12,8 +12,8 @@ import time
 import mechfight as mf
 
 
-# Policy settings. Live physics and weapon values are read from hello and observations.
-PLAY_MODE = "practice"  # Set to "free-for-all" to use the survive-first policy.
+
+PLAY_MODE = "practice"  
 PLAN_BUDGET_S = 0.006
 ROUTE_SLICE_S = 0.0015
 ROUTE_NODES_PER_TICK = 280
@@ -135,9 +135,9 @@ def accelerate(velocity, desired, change):
 
 
 def intercept(origin, target, velocity, delay, speed, barrel, gravity=0):
-    """Find the low shot: muzzle offset + flight distance meets the moving aim point."""
+    
     position = tuple(p + v * delay - o for p, v, o in zip(target, velocity, origin))
-    if speed == 0:  # Hitscan.
+    if speed == 0:  
         return position, 0.0
     x, y, z = position
     vx, vy, vz = velocity
@@ -163,7 +163,7 @@ def read_map_file(path):
 
 
 class Arena:
-    """A raster of terrain and vertical solid intervals, plus ground clearance for routing."""
+    
 
     def __init__(self, directory, height, step_up, slope):
         world = json.loads(read_map_file(os.path.join(directory, "v2/world.json")))
@@ -218,7 +218,7 @@ class Arena:
                     break
             floor[idx] = level
 
-        # Distance transform in grid units. Edges are kept out of pathfinding separately.
+        
         diag = math.sqrt(2)
         for y in range(1, h - 1):
             for i in range(y * w + 1, (y + 1) * w - 1):
@@ -713,7 +713,7 @@ class Bot:
         upgrade_gap = min((threshold - cubes for threshold in self.upgrade_thresholds if threshold > cubes),
                           default=math.inf)
         stat_gain = limit(cube_cap - cubes, 0, 1)
-        # Discount progress toward distant offers, including after the stat cap.
+        
         upgrade_value = CUBE_UPGRADE_VALUE_M / (1 + CUBE_UPGRADE_DISCOUNT * max(0, upgrade_gap - 1))
         cube_value = CUBE_STAT_VALUE_M * stat_gain + upgrade_value
         cube_reach = limit(number(self.cubes.get("pickup_radius"), 3.5), 0.5, 15)
@@ -750,7 +750,8 @@ class Bot:
                 return p[:2]
         return None
 
-    def route(self, pos, goal, zone, radius, height, stuck, until, *, waypoint_score=None):
+    def route(self, pos, goal, zone, radius, height, stuck, until, *, waypoint_score=None,
+              waypoint_span=math.inf):
         arena = self.arena
         if arena is None or distance(pos, goal) < 0.5:
             return goal
@@ -762,7 +763,7 @@ class Bot:
         elevated = pos[2] > arena.floor[cell] + arena.step_up + 1.5
         if (close_at_end and distance(pos, goal) < ROOF_APPROACH_M and end_cell is not None
                 and arena.roof[end_cell] > arena.floor[end_cell] + arena.step_up):
-            # A roof inside the final circle is reachable by jet even when ground routing goes around it.
+            
             return goal
         if (elevated or not stuck) and distance(pos, goal) < ROUTE_DIRECT_M and arena.corridor(pos, goal, radius, height):
             self.path, self.search, self.route_goal = (), None, None
@@ -789,7 +790,8 @@ class Bot:
             best = None
             for i in range(min(self.path_index + ROUTE_LOOKAHEAD_CELLS, len(self.path) - 1), self.path_index - 1, -1):
                 point = self.path[i]
-                if not arena.corridor(pos, point, radius, height):
+                if (waypoint_span < math.inf and distance(pos, point) > waypoint_span
+                        or not arena.corridor(pos, point, radius, height)):
                     continue
                 if waypoint_score is None:
                     self.path_index = i
@@ -867,7 +869,7 @@ class Bot:
                 break
             mx, my = math.cos(course + offset) * scale, math.sin(course + offset) * scale
             x, y, z = pos
-            # The first probe includes inertial drift as the new velocity takes effect.
+            
             turn = min(0.14 if grounded else 0.26, horizon * 0.5)
             px, py = x + (vel[0] * turn + mx * pace * (horizon - turn)), y + (vel[1] * turn + my * pace * (horizon - turn))
             endpoint = px, py, z
@@ -887,7 +889,7 @@ class Bot:
                 if drop_hint is not None and progress > 0:
                     if not arena.clear_ray(raised(drop_hint, 7), raised(endpoint, height * 0.65)):
                         score += 2
-                # Keep a wall between us and a second mech while disengaging.
+                
                 if concealed_muzzle is not None and arena.clear_ray(concealed_muzzle, raised(endpoint, height * 0.65)):
                     score -= SQUAD_EXPOSURE_PENALTY
             for c in steering_threats:
@@ -916,7 +918,7 @@ class Bot:
                 and (stuck or core or terminal_roof) and energy > JET_RESERVE):
             overhead = arena.solid(raised(pos, height + 1.0))
             if not overhead:
-                # A short approach when facing a wall buys altitude while preserving jet fuel.
+                
                 move = dx * 0.52, dy * 0.52
                 jump, jet = grounded, not grounded
         if speed_cap is None and not grounded:
@@ -1089,8 +1091,8 @@ class Bot:
             weapon = weapons[index]
             kind = weapon["kind"]
             yaw_error, pitch_error = abs(angle(yaw - actual[0])), abs(pitch - actual[1])
-            # Keep a narrow gate until the actual torso is almost aligned. Rotation on this
-            # simulation step is limited, so a distant shot cannot rely on the commanded angle.
+            
+            
             yaw_allow = min(ARMING_YAW_ALLOW_RAD, self.phys("turn_rate", 4, stats) * self.physics_dt * 0.52)
             pitch_allow = min(ARMING_PITCH_ALLOW_RAD, self.phys("pitch_rate", 3, stats) * self.physics_dt * 0.52)
             aligned = yaw_error <= tolerance + yaw_allow and (kind == "lightning" or pitch_error <= vertical + pitch_allow)
@@ -1124,9 +1126,11 @@ class Bot:
                 if ammo <= 0 or (safe and selected is None and ammo <= mag * RELOAD_FRACTION):
                     action["reload"] = True
 
-    def act(self, obs):
+    def act(self, obs, *, deadline=None):
         begin = time.perf_counter()
         until = begin + PLAN_BUDGET_S
+        if deadline is not None:
+            until = min(until, deadline)
         obs = obj(obs)
         me = obj(obs.get("self"))
         zone_obs = obj(obs.get("zone"))
@@ -1170,8 +1174,8 @@ class Bot:
         terminal_burn = False
         if not in_zone:
             if zone.next_radius == 0 and zone.dps > 0:
-                # Even straight-line travel to the current edge is too slow in this case.
-                # A collapsed center at the reported position can still be unsafe due to rounding.
+                
+                
                 pace = limit(self.phys("boost_speed", 19.5, stats), walk, 90)
                 survival = min(hp / zone.dps, max(0, self.match_end - now))
                 terminal_burn = (-gap > pace * survival
@@ -1240,7 +1244,7 @@ class Bot:
                 direction = angle(self.scout_yaw + now * SCAN_RATE)
         action["aim"] = [direction, 0.0]
         if time.perf_counter() < until:
-            # Small-circle steering still centers the mech when holding is safe.
+            
             must_move = urgent and (not in_zone or size > DEATH_CIRCLE_M or zone.gap(pos, STEER_HORIZON_S) < 0)
             self.combat(obs, pos, weapons, actual, stats, contacts, safe, must_move, evade, energy, fraction, zone,
                         action, until, terminal_burn, repairing, bool(hazards))
@@ -1370,8 +1374,8 @@ class PracticeBot(Bot):
 
     def upgrade(self, offer, p, zone):
         kinds = [w.get("kind") for w in p.weapons]
-        # Estimate impact on the next duel. A specialized weapon gets most of its value
-        # when we can actually field it; gun upgrades still help fill the other cooldown.
+        
+        
         gun_share = 1.0 if all(k in (None, "gun") for k in kinds) else 0.55
         weights = {"plating": 15, "armor": 9, "nanites": 8 + 12 * (1 - p.fraction),
                    "servos": 7, "gyros": 6, "reactor": 5, "jets": 4, "capacitor": 3,
@@ -1429,7 +1433,7 @@ class PracticeBot(Bot):
                 action["drop"] = swap
             goal = None
 
-        # When the kill was behind a corner, first get close enough to see its drops.
+        
         collects = []
         located = set()
         cube_reach = limit(number(self.cubes.get("pickup_radius"), 3.5), 0.5, 15)
@@ -1537,7 +1541,7 @@ class PracticeBot(Bot):
         if commanded is not None and (abs(angle(yaw - commanded[0])) > width
                                       or (kind != "lightning" and abs(pitch - commanded[1]) > height)):
             return False
-        # Allow a fraction of one sim step of turning before a ready trigger can fire.
+        
         yaw_step = limit(self.phys("turn_rate", 4, p.stats), 0, 20) * self.physics_dt * 0.68
         pitch_step = limit(self.phys("pitch_rate", 3, p.stats), 0, 20) * self.physics_dt * 0.68
         return (abs(angle(yaw - p.aim[0])) <= width + yaw_step
@@ -1592,8 +1596,8 @@ class PracticeBot(Bot):
                         fire_now = target.id
                 break
         else:
-            # Hold briefly while tracing a mech behind a corner. A full charge eventually
-            # fires on its own, so clear it once there is no longer an upcoming peek.
+            
+            
             if active_charge is not None and targets:
                 w = p.weapons[active_charge]
                 fire[active_charge] = number(w.get("charge")) < self.setting(w, "charge", 0.75)
@@ -1660,7 +1664,7 @@ class PracticeBot(Bot):
         if target.aim is not None:
             facing = angle(bearing(target.pos, p.pos) - target.aim[0])
             if 0.56 < abs(facing) < 2.35 and not retreat:
-                # In our frame the tangent in the opposite direction increases the flank angle.
+                
                 tangent -= math.copysign(0.30, facing)
         yaw = course + math.atan2(tangent, radial)
         boost = p.grounded and p.energy > (26 if retreat else 38) and (bool(hazards) or retreat or self.sprint)
@@ -1843,8 +1847,8 @@ class PracticeBot(Bot):
                      else angle(bearing(pos, goal) + 0.74 * math.sin(1.35 * now + self.scout_yaw)))
         action["aim"] = [direction, 0.0]
 
-        # Hold the repair timer once we have broken contact. Emergency shots remain available
-        # when a hunter has a clear line or we can end the fight quickly.
+        
+        
         if self.repairing and not can_finish and not (target and target.clear and (cover is None or target.dist < 24)):
             targets = []
         if not targets and not self.repairing and not urgent and loot is None and not terminal:

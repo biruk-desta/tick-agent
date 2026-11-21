@@ -1,4 +1,4 @@
-"""Independent practice policy with sliced navigation, cover and home searches."""
+
 from array import array
 from collections import deque
 import heapq
@@ -10,13 +10,13 @@ import time
 
 
 class World:
-    """Static map with exact prism rays and a 2 m navigation graph.
+    
 
-    The caller supplies decoded map metadata and terrain bytes. With no map,
-    use flat terrain.
-    begin_tick sets a deadline without doing work. Searches preserve their
-    frontier between calls; callers must call again while *_pending is true.
-    """
+
+
+
+
+
     ns = 2.0
     _dirs = ((1, 0), (-1, 0), (0, 1), (0, -1),
              (1, 1), (1, -1), (-1, 1), (-1, -1))
@@ -580,7 +580,7 @@ class World:
         return total/4800
 
 
-# These are policy parameters, not replacements for the live weapon/mech stats.
+
 BASE = dict(ghost=True, peek=True, laser_range=85., loot_radius=90.,
             crate_until=150., target_limit=215., hp_weight=60/1400,
             sticky=0., low_bonus=0., fight_loot=0., farm_hp=.7,
@@ -645,7 +645,6 @@ class Contact:
 
 
 class Practice:
-    """Independent implementation of the written active-default/squad policy."""
     def __init__(self, hello, seed):
         self.cfg = hello.get("config") or {}
         self.rng = random.Random(seed)
@@ -1052,7 +1051,7 @@ class Practice:
         if complete:
             self.cover_job, self.cover_at = None, self.now
         goal = job["best"]
-        # A search spread over observations must not commit obsolete concealment.
+        
         if goal is not None and self.hidden(goal, eyes):
             self.cover_goal = goal
             return (0., 0.) if gap(pos, goal) < 1.5 else self.travel(goal)
@@ -1213,7 +1212,7 @@ class Practice:
             edge = gap(point, job["zone"])/max(30, job["zone"][2])
             return 120*self.world.exposure(*point)+.25*gap(point, job["origin"])+40*crowd+10*edge
 
-        # One complete sample per idle tick; draw all 80 random values up front.
+        
         if job["points"] and time.perf_counter() <= self.deadline:
             point = job["points"].popleft()
             value = cost(point)
