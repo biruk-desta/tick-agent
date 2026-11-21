@@ -25,6 +25,9 @@ SECOND_RANK = {"lightning": 3, "laser": 2, "mortar": 1}
 VEL_SMOOTH = 0.35          # weight of the newest velocity sample in the per-target average
 RETREAT_FRACTION = 0.30    # break contact below this health share when the duel is going badly
 NPC_FARM_M = 120.0
+GUN_RANGE_M = 38.0
+STRAFE_MIN_S = 0.3
+STRAFE_MAX_S = 0.7          # preferred duel range with the gun alone
 CRATE_FARM_M = 70.0
 
 
@@ -95,7 +98,7 @@ class DuelBot(Bot):
         elif "mortar" in kinds:
             r = 60.0
         else:
-            r = 38.0
+            r = GUN_RANGE_M
         if "lightning" in theirs and "lightning" not in kinds:
             r = max(r, 55.0)          # stay out of their arc
         if "mortar" in theirs and "lightning" in kinds:
@@ -120,7 +123,7 @@ class DuelBot(Bot):
         want = self.desired_range(kinds, foe)
         if now >= self.strafe_until:
             self.strafe_sign = -self.strafe_sign if self.rng.random() < 0.8 else self.strafe_sign
-            self.strafe_until = now + self.rng.uniform(0.35, 1.1)
+            self.strafe_until = now + self.rng.uniform(STRAFE_MIN_S, STRAFE_MAX_S)
         to_me = bearing(foe.pos, pos)
         radial = limit((d - want) / 12.0, -1.0, 1.0)           # >0: too far, close in
         # Move tangentially around the foe, plus a radial correction toward the wanted range.
