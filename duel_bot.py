@@ -381,6 +381,8 @@ class DuelBot(Bot):
             boosting = action.pop("boost", False)
             self.combat(obs, pos, weapons, actual, stats, contacts, True, urgent, False, energy, 1.0, zone,
                         action, until + 0.002, terminal_burn, False, bool(hazards))
+            if foe is not None and foe.kind == "mech":
+                self.laser_control(action, weapons, pos, actual, foe, cubes)
             charging = any(f and w.get("kind") == "laser" for f, w in zip(action.get("fire", ()), weapons))
             action["boost"] = bool(boosting) and not charging
         return action
@@ -419,6 +421,45 @@ class DuelBot(Bot):
             reach = {"near": 40, "mid": 100}.get(sound.get("dist"), 180)
             self.hunt_point = (now, (pos[0] + reach * math.cos(b), pos[1] + reach * math.sin(b), pos[2]))
             return
+
+    def laser_control(self, action, weapons, pos, actual, foe, cubes):
+        """Pre-charge on a known foe; release on the actual aim at full charge, or early when the
+        partial beam already kills."""
+        fire = list(action.get("fire") or [False, False])
+        while len(fire) < 2:
+            fire.append(False)
+        cfg = obj(self.weapon_config.get("laser"))
+        for i, w in enumerate(weapons):
+            if w.get("kind") != "laser":
+                continue
+            stats = obj(w.get("stats"))
+            full = number(stats.get("charge"), number(cfg.get("charge"), 0.75))
+            reach = number(stats.get("range"), number(cfg.get("range"), 280))
+            dmg = number(stats.get("damage"), number(cfg.get("damage"), 315))
+            min_frac = number(cfg.get("min_frac"), 0.35)
+            min_charge = number(cfg.get("min_charge"), 0.15)
+            charge = number(w.get("charge"))
+            cooldown = number(w.get("cooldown"))
+            d = foe.dist
+            if d > reach:
+                continue
+            body = self.phys("radius", 2.5) * foe.scale
+            error = abs(angle(bearing(pos, foe.pos) - actual[0]))
+            aligned = foe.clear and error < math.atan2(body * 0.8, max(d, 1.0))
+            if charge <= 0:
+                # Pre-charge while the foe is tracked, the weapon is ready and the shot is near.
+                fire[i] = cooldown <= self.physics_dt + 0.01 and (foe.clear or d < 120)
+                continue
+            mult = 1 + number(self.cubes.get("damage_per_cube"), 0.04) * min(cubes, number(self.cubes.get("stat_cap"), 10))
+            if "mortar" in foe.armed:
+                mult *= 1 + number(cfg.get("cookoff"), 0.6)
+            partial = dmg * (min_frac + (1 - min_frac) * min(1.0, charge / max(full, 0.01))) * mult
+            kills = math.isfinite(foe.hp) and partial >= foe.hp and charge >= min_charge
+            if aligned and (charge >= full - self.physics_dt or kills):
+                fire[i] = False      # let go: the beam fires along the actual aim
+            else:
+                fire[i] = True       # keep charging (auto-fire after hold_s is the server's)
+        action["fire"] = fire
 
     def farm_goal(self, obs, pos, contacts, zone):
         best, goal = math.inf, None
