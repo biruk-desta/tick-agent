@@ -479,15 +479,34 @@ def _fallback(obs, tick):
     zone = zone if isinstance(zone, dict) else {}
     pos, center = _pair(me.get("pos")), _pair(zone.get("center"))
     action = {"tick": tick, "move": [0.0, 0.0], "aim": _pair(me.get("aim")) or [0.0, 0.0]}
+    radius = zone.get("radius")
+    has_circle = type(radius) in (int, float) and 0 <= radius <= 1e9
     if pos is not None and center is not None:
         dx, dy = center[0] - pos[0], center[1] - pos[1]
         distance = math.hypot(dx, dy)
-        radius = zone.get("radius")
-        at_edge = type(radius) in (int, float) and 0 <= radius <= 1e9 and distance >= radius * 0.72
+        at_edge = has_circle and distance >= radius * 0.72
         if distance and (me.get("in_zone") is False or at_edge):
             scale = max(distance, 3.0)
             action["move"] = [dx / scale, dy / scale]
             action["aim"] = [math.atan2(dy, dx), 0.0]
+            return action
+    if has_circle and radius <= 7:
+        return action
+    velocity = _pair(me.get("vel"))
+    if velocity is not None and (speed := math.hypot(*velocity)) >= 0.5:
+        action["move"] = [component / speed for component in velocity]
+    events = obs.get("events")
+    if isinstance(events, list):
+        for event in reversed(events[:24]):
+            if not isinstance(event, dict) or event.get("type") != "damaged" or event.get("weapon") == "zone":
+                continue
+            yaw = event.get("bearing")
+            if type(yaw) not in (int, float) or not -math.tau <= yaw <= math.tau:
+                continue
+            action["aim"] = [yaw, 0.0]
+            if action["move"] == [0.0, 0.0]:
+                action["move"] = [-math.sin(yaw), math.cos(yaw)]
+            break
     return action
 
 
