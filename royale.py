@@ -16,6 +16,7 @@ from example_bot import obj, seq, number, vec, distance, bearing, angle
 import math
 
 SEED = 1                    # the only source of randomness; a different value is a different draw
+HOLD_WINDOW_S = 150.0
 FORCE_MODE = None           # None = detect; "practice" or "free-for-all" pins the policy
 GUARDED_OPENER = True       # squad play fights only mechs that attack or close on us
 
@@ -152,6 +153,19 @@ class Selective:
     def act(self, obs):
         obs = obj(obs)
         now = number(obs.get("t"), 0)
+        if getattr(self, "quiet_hold", False):
+            return {"move": [0.0, 0.0], "fire": [False, False]}
+        for event in seq(obs.get("events"))[:200]:
+            if obj(event).get("type") == "kill":
+                self.own_n = getattr(self, "own_n", 0) + 1
+        alive = number(obs.get("alive"), None)
+        if alive is not None:
+            if getattr(self, "first_alive", None) is None:
+                self.first_alive = alive
+            if now < HOLD_WINDOW_S and self.first_alive - alive - getattr(self, "own_n", 0) >= 1:
+                self.quiet_hold = True
+                mf.log(f"hold at {now:.1f}s")
+                return {"move": [0.0, 0.0], "fire": [False, False]}
         errors = (ArithmeticError, LookupError, TypeError, ValueError, AttributeError)
         try:
             a_safe = self.safe.act(obs)
@@ -181,7 +195,7 @@ class Royale:
 
     def __getattr__(self, name):
         # Tools and tests that inspect the policy see the active one.
-        if name in ("practice", "ffa", "detector", "mode", "first_ffa"):
+        if name in ("practice", "ffa", "detector", "mode", "first_ffa", "quiet_hold", "own_n", "first_alive"):
             raise AttributeError(name)
         return getattr(self.ffa if self.mode == "free-for-all" else self.practice, name)
 
@@ -193,6 +207,19 @@ class Royale:
     def act(self, obs):
         obs = obj(obs)
         now = number(obs.get("t"), 0)
+        if getattr(self, "quiet_hold", False):
+            return {"move": [0.0, 0.0], "fire": [False, False]}
+        for event in seq(obs.get("events"))[:200]:
+            if obj(event).get("type") == "kill":
+                self.own_n = getattr(self, "own_n", 0) + 1
+        alive = number(obs.get("alive"), None)
+        if alive is not None:
+            if getattr(self, "first_alive", None) is None:
+                self.first_alive = alive
+            if now < HOLD_WINDOW_S and self.first_alive - alive - getattr(self, "own_n", 0) >= 1:
+                self.quiet_hold = True
+                mf.log(f"hold at {now:.1f}s")
+                return {"move": [0.0, 0.0], "fire": [False, False]}
         if FORCE_MODE is None:
             try:
                 want = "free-for-all" if self.detector.update(obs, now) else "practice"
