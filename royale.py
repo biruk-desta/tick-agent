@@ -25,7 +25,7 @@ PAUSE_MED_MS = 8.0
 PAUSE_MIN_MS = 4.0
 PAUSE_SHOW = False
 USE_PAUSE = False
-USE_E = True
+USE_E = False
 USE_R = True
 USE_H2 = True
 
