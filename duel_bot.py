@@ -56,6 +56,26 @@ ARM_STALL_S = 6.0           # no 2 m of progress for this long while detouring: 
 ARM_FORGET_M = 35.0         # in plain sight this close and not listed: someone took it
 ARM_CUBE_FIRST_M = 20.0     # a cube this close is collected on the way
 ARM_LASER_EDGE_M = 60.0     # a laser wins unless a lightning is this much closer
+# Practice fight discipline (P2). Each switch acts only on the practice instance (DuelBot.squad).
+PR_RETREAT2 = True          # retreat when two or three hunters are on us, or the damage race is lost
+PR_KEEP_LASER_RANGE = True  # holding a laser: keep laser range against laser hunters (no 30 m rush)
+PR_LL_RANGE = True          # laser + lightning: close to arc range only when healthy and the foe is weaker
+PR_DUCK = True              # gun reloading and nothing else ready: step behind cover within 18 m
+PR_LASER_LOS = True         # start a laser charge only on a mech in sight; never dump a charge into a wall
+PR_BOOST_STRAFE = False     # boost through fights with 70/30 energy hysteresis, charging or not
+PR_UPGRADES = True          # laser_charge / laser_damage near the top of the upgrade order
+PR_NEAR_M = 160.0           # hunters in sight this close count as "on us"
+PR_TWO_HP = 0.55            # two on us and below this share: retreat
+PR_THREE_HP = 0.80          # three on us and below this share: retreat
+PR_LOW_HP = 0.35            # below this share against a foe at least 0.10 healthier: retreat
+PR_RACE_DPS = 60.0          # damage race: taking more than this per second (4 s window) ...
+PR_RACE_RATIO = 0.8         # ... and our time to die under 0.8 x their time to die ...
+PR_RACE_HP = 0.75           # ... while below this share
+PR_LL_HP = 0.60             # laser + lightning: arc range only above this share
+PR_DUCK_M = 18.0            # cover must be this close to duck
+PR_DUCK_READY_S = 0.3       # another weapon this close to ready: keep fighting instead of ducking
+PR_BOOST_ON, PR_BOOST_OFF = 70.0, 30.0
+PR_UPGRADE_RANK = dict(DUEL_UPGRADES, laser_charge=99, laser_damage=95)
 
 
 class DuelBot(Bot):
@@ -78,6 +98,11 @@ class DuelBot(Bot):
         self.arm_seen = {}         # pickup id -> (kind, pos) for lasers and lightning seen this match
         self.arm_banned = set()    # pickups given up on
         self.arm_progress = None   # (id, best distance, time of last progress, last arm tick)
+        self.squad = False         # P2 practice discipline (set by royale for the practice policy only)
+        self.dmg_in, self.dmg_out = [], []   # (time, amount) over the last 4 s
+        self.boost_latch = False
+        self.laser_plan = False
+        self.my_hp = 1400.0
 
     # ------------------------------------------------------------------ targets
     def track(self, contacts):
@@ -141,7 +166,9 @@ class DuelBot(Bot):
     # ----------------------------------------------------------------- movement
     def desired_range(self, kinds, foe):
         theirs = {k for k in foe.armed if k in KNOWN_WEAPONS}
-        if "lightning" in kinds:
+        weaker = math.isfinite(foe.hp) and foe.hp < self.my_hp
+        if "lightning" in kinds and not (self.squad and PR_LL_RANGE and "laser" in kinds
+                                         and not (self.hp_share > PR_LL_HP and weaker)):
             r = 26.0
         elif "laser" in kinds:
             r = LASER_RANGE_M
@@ -153,7 +180,7 @@ class DuelBot(Bot):
             r = max(r, 55.0)          # stay out of their arc
         if "mortar" in theirs and "lightning" in kinds:
             r = min(r, 22.0)          # inside the shell's useful range
-        if "laser" in theirs and "lightning" not in kinds:
+        if "laser" in theirs and "lightning" not in kinds and not (self.squad and PR_KEEP_LASER_RANGE and "laser" in kinds):
             r = min(r, 30.0)
         return r
 
@@ -200,6 +227,12 @@ class DuelBot(Bot):
             self.strafe_until = now + self.rng.uniform(0.35, 0.9)
         boost = (energy > 45 and (d > want + 25 or (foe.clear and foe.dist < 90 and "lightning" not in kinds))
                  or self.dodging and energy > 15)
+        if self.squad and PR_BOOST_STRAFE:
+            if energy > PR_BOOST_ON:
+                self.boost_latch = True
+            elif energy < PR_BOOST_OFF:
+                self.boost_latch = False
+            boost = self.boost_latch
         return [math.cos(free), math.sin(free)], boost
 
     # ---------------------------------------------------------------------- act
@@ -224,7 +257,8 @@ class DuelBot(Bot):
         if offer:
             def rank(i):
                 ident = obj(offer[i]).get("id")
-                return DUEL_UPGRADES.get(ident, 0) if isinstance(ident, str) else 0
+                table = PR_UPGRADE_RANK if self.squad and PR_UPGRADES else DUEL_UPGRADES
+                return table.get(ident, 0) if isinstance(ident, str) else 0
             action["pick"] = max(range(len(offer)), key=rank)
         if pos is None:
             return action
@@ -239,6 +273,7 @@ class DuelBot(Bot):
         hp = max(0, number(me.get("hp"), 1400))
         fraction = limit(hp / max(1, number(me.get("max_hp"), 1400)), 0, 1)
         self.hp_share = fraction
+        self.my_hp = hp
         energy = limit(number(me.get("energy"), 0), 0, 1000)
         grounded = me.get("grounded") is not False
         cubes = limit(number(me.get("cubes")), 0, 100)
@@ -276,6 +311,14 @@ class DuelBot(Bot):
                 seen = self.last_seen.get(victim)
                 if seen is not None:
                     self.kill_spot = (now, seen[1])
+            if self.squad and PR_RETREAT2:
+                amount = limit(number(event.get("amount")), 0, 5000)
+                if event.get("type") == "damaged" and event.get("weapon") != "zone" and len(self.dmg_in) < 200:
+                    self.dmg_in.append((now, amount))
+                elif event.get("type") == "hit" and 0 <= number(event.get("target"), -1) < 100 and len(self.dmg_out) < 200:
+                    self.dmg_out.append((now, amount))
+        self.dmg_in = [e for e in self.dmg_in if now - e[0] <= 4.0]
+        self.dmg_out = [e for e in self.dmg_out if now - e[0] <= 4.0]
         self.update_hunt_point(obs, pos, now)
         items = seq(me.get("weapons"))
         weapons = [obj(items[i]) if i < len(items) else {} for i in range(2)]
@@ -301,7 +344,18 @@ class DuelBot(Bot):
         # Retreat to repair when losing badly and the foe is not nearly dead.
         if foe is not None and fraction < RETREAT_FRACTION and foe_share > fraction + 0.15 and len(visible) >= 1:
             self.retreat_until = now + 4.0
-        if foe is not None and foe_share < 0.25 and fraction > 0.12:
+        near = [c for c in visible if c.dist < PR_NEAR_M]
+        if self.squad and PR_RETREAT2 and foe is not None:
+            losing = ((len(near) >= 2 and fraction < PR_TWO_HP) or (len(near) >= 3 and fraction < PR_THREE_HP)
+                      or (fraction < PR_LOW_HP and foe_share > fraction + 0.10 and visible))
+            taken = sum(a for _, a in self.dmg_in) / 4.0
+            dealt = sum(a for _, a in self.dmg_out) / 4.0
+            if (taken > PR_RACE_DPS and fraction < PR_RACE_HP and math.isfinite(foe.hp)
+                    and hp / taken < PR_RACE_RATIO * foe.hp / max(1.0, dealt)):
+                losing = True
+            if losing:
+                self.retreat_until = max(self.retreat_until, now + 4.0)
+        if foe is not None and foe_share < 0.25 and fraction > 0.12 and not (self.squad and PR_RETREAT2 and len(near) >= 3):
             self.retreat_until = -math.inf   # finish it
         retreating = now < self.retreat_until or (len(visible) >= 3 and fraction < 0.6)
         arm_goal = None
@@ -329,7 +383,16 @@ class DuelBot(Bot):
                 c = bearing(pos, cube)
                 move = [math.cos(c), math.sin(c)]
                 boost = energy > 30
-            if not foe.clear and foe.dist > 30:
+            if self.squad and PR_DUCK and cube is None and self.should_duck(weapons, foe, energy):
+                cover = None
+                if time.perf_counter() < until:
+                    cover = self.shelter_point(pos, zone, contacts, bearing(pos, foe.pos), radius, height, now,
+                                               min(until, begin + SHELTER_SLICE_S), False)
+                if cover is not None and distance(pos, cover) < PR_DUCK_M:
+                    # Gun reloading and nothing else ready: out of sight until it is back.
+                    self.mode = "duck"
+                    goal, move, boost = cover, None, energy > 25
+            if self.mode != "duck" and not foe.clear and foe.dist > 30:
                 # Close in along a route rather than strafing into a wall.
                 waypoint = self.route(pos, foe.pos[:2], zone, radius, height, now < self.stuck_until,
                                       min(until, time.perf_counter() + eb.ROUTE_SLICE_S))
@@ -433,14 +496,50 @@ class DuelBot(Bot):
             self.combat(obs, pos, weapons, actual, stats, contacts, True, urgent, False, energy, 1.0, zone,
                         action, until + 0.002, terminal_burn, False, bool(hazards))
             charging = any(f and w.get("kind") == "laser" for f, w in zip(action.get("fire", ()), weapons))
-            action["boost"] = bool(boosting) and not charging
+            action["boost"] = bool(boosting) and (not charging or (self.squad and PR_BOOST_STRAFE and self.mode == "duel"))
         return action
 
     def aim_for(self, weapon, target, base, muzzle, pitch_bounds):
         # With arm-early on, the laser is kept for mechs: the gun (or the arc) takes drones and crates.
         if self.arm and target.kind != "mech" and weapon.get("kind") == "laser":
             return None
-        return super().aim_for(weapon, target, base, muzzle, pitch_bounds)
+        if (self.squad and PR_LASER_LOS and weapon.get("kind") == "laser" and number(weapon.get("charge")) <= 0
+                and not (target.kind == "mech" and target.clear)):
+            return None    # a new charge only on a mech we can see
+        plan = super().aim_for(weapon, target, base, muzzle, pitch_bounds)
+        if plan is not None and weapon.get("kind") == "laser":
+            self.laser_plan = True
+        return plan
+
+    def combat(self, obs, pos, weapons, actual, stats, contacts, safe, must_move, evade, energy, fraction, zone,
+               action, until, terminal_burn, repairing, incoming):
+        self.laser_plan = False
+        super().combat(obs, pos, weapons, actual, stats, contacts, safe, must_move, evade, energy, fraction, zone,
+                       action, until, terminal_burn, repairing, incoming)
+        if self.squad and PR_LASER_LOS and not self.laser_plan and not must_move:
+            # Sight lost mid-charge: keep holding (it fires by itself after hold_s) rather than
+            # letting go into a wall; the target often steps back out.
+            firing = action.get("fire")
+            for i, weapon in enumerate(weapons):
+                if weapon.get("kind") == "laser" and number(weapon.get("charge")) > 0 and isinstance(firing, list):
+                    firing[i] = True
+
+    def should_duck(self, weapons, foe, energy):
+        """Gun reloading, nothing else ready, foe not on top of us."""
+        if foe.dist <= 30:
+            return False
+        gun = next((w for w in weapons if w.get("kind") == "gun"), None)
+        if gun is None:
+            return False
+        if not (number(gun.get("reload")) > 0.6 or number(gun.get("ammo"), 1) <= 0):
+            return False
+        for w in weapons:
+            kind = w.get("kind")
+            if kind == "laser" and number(w.get("cooldown")) < PR_DUCK_READY_S:
+                return False
+            if kind == "lightning" and number(w.get("cooldown")) < PR_DUCK_READY_S and energy > eb.BOOST_RESERVE:
+                return False
+        return True
 
     def arm_remember(self, obs, pos, eye):
         listed = set()

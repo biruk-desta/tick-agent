@@ -784,6 +784,7 @@ class Royale:
         self.practice = duel_bot.DuelBot(hello)
         self.practice.guarded = GUARDED_OPENER
         self.practice.arm = PRACTICE_ARM
+        self.practice.squad = True
         self.ffa = Selective(hello)
         self.detector = Detector(hello)
         self.mode = FORCE_MODE or "practice"
