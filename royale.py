@@ -812,17 +812,10 @@ class Royale:
                     self.first_ffa = round(now, 1)
                 mf.log(f"mode {want}: {self.detector.reason}")
         if self.mode == "free-for-all":
-            action = self.ffa.act(obs)
-            g_med, g_min = mf.pause_ms
-            if (PAUSE_SHOW and g_med is not None and 1.3 <= now < 3.7 and action.get("aim")
-                    and not self.ffa.disengage and not any(number(w.get("charge")) > 0 for w in self.ffa.weapon_slots)):
-                gap = g_med if now < 2.5 else g_min
-                action["aim"] = [math.radians(-170 + 5 * min(gap, 68)), 0.0]
-                action["fire"] = [False, False]
-            return action
+            return self.ffa.act(obs)
         self.ffa.record(obs, vec(obj(obs.get("self")).get("pos"), 3), now)
         return self.practice.act(obs)
 
 
 if __name__ == "__main__":
-    mf.run(Royale)
+    mf.run(Royale, pause_show=PAUSE_SHOW)
