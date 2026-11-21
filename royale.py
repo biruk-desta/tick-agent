@@ -181,7 +181,7 @@ class Royale:
 
     def __getattr__(self, name):
         # Tools and tests that inspect the policy see the active one.
-        if name in ("practice", "ffa", "detector", "mode", "first_ffa"):
+        if name in ("practice", "ffa", "detector", "mode", "first_ffa", "opener"):
             raise AttributeError(name)
         return getattr(self.ffa if self.mode == "free-for-all" else self.practice, name)
 
@@ -205,7 +205,37 @@ class Royale:
                 mf.log(f"mode {want}: {self.detector.reason}")
         if self.mode == "free-for-all":
             return self.ffa.act(obs)
-        return self.practice.act(obs)
+        a_duel = self.practice.act(obs)
+        try:
+            a_safe = self.ffa.act(obs)
+        except (ArithmeticError, LookupError, TypeError, ValueError, AttributeError):
+            return a_duel
+        me = obj(obs.get("self"))
+        pos = vec(me.get("pos"), 3)
+        if pos is None:
+            return a_duel
+        rows = []
+        for e in seq(obs.get("mechs"))[:48]:
+            e = obj(e)
+            p = vec(e.get("pos"), 3)
+            if p is not None and e.get("kind") == "mech":
+                rows.append((number(e.get("id"), -1), p, vec(e.get("vel"), 3) or (0, 0, 0), vec(e.get("aim"), 2)))
+        recent = {k for k in self.practice.hits if isinstance(k, (int, float)) and 0 <= k < 16}
+        committed = False
+        for ident, p, v, aim in rows:
+            if ident not in recent:
+                continue
+            d = distance(pos, p)
+            closing = ((pos[0] - p[0]) * v[0] + (pos[1] - p[1]) * v[1]) / max(d, 1.0)
+            facing = aim is not None and abs(angle(bearing(p, pos) - aim[0])) < 0.5
+            if closing > 1.0 or (facing and d < 140):
+                committed = True
+        crowded = any(distance(pos, p) < 150 for _, p, _, _ in rows)
+        if committed or (self.practice.mode in ("loot", "cube", "spoils", "drop") and not crowded):
+            self.opener = "duel"
+            return a_duel
+        self.opener = "safe"
+        return a_safe
 
 
 if __name__ == "__main__":
