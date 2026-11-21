@@ -20,6 +20,7 @@ DUEL_UPGRADES = {
     "lightning_chain": 50, "jets": 48, "sensors": 46, "mortar_reload": 30, "mortar_velocity": 28,
     "mortar_splash": 26, "laser_pierce": 20,
 }
+KNOWN_WEAPONS = ("gun", "mortar", "laser", "lightning")
 SECOND_RANK = {"lightning": 3, "laser": 2, "mortar": 1}
 VEL_SMOOTH = 0.35          # weight of the newest velocity sample in the per-target average
 RETREAT_FRACTION = 0.30    # break contact below this health share when the duel is going badly
@@ -86,7 +87,7 @@ class DuelBot(Bot):
 
     # ----------------------------------------------------------------- movement
     def desired_range(self, kinds, foe):
-        theirs = set(foe.armed)
+        theirs = {k for k in foe.armed if k in KNOWN_WEAPONS}
         if "lightning" in kinds:
             r = 26.0
         elif "laser" in kinds:
@@ -143,6 +144,13 @@ class DuelBot(Bot):
     def act(self, obs):
         if PLAY_MODE != "practice":
             return super().act(obs)
+        try:
+            return self.duel_act(obs)
+        except (ArithmeticError, LookupError, TypeError, ValueError, AttributeError) as error:
+            mf.log(f"duel policy error, using the survive-first policy this tick: {error!r}")
+            return super().act(obs)
+
+    def duel_act(self, obs):
         begin = time.perf_counter()
         until = begin + eb.PLAN_BUDGET_S
         obs = obj(obs)
@@ -197,7 +205,7 @@ class DuelBot(Bot):
         self.track(contacts)
         items = seq(me.get("weapons"))
         weapons = [obj(items[i]) if i < len(items) else {} for i in range(2)]
-        kinds = {w.get("kind") for w in weapons if w.get("kind")}
+        kinds = {w.get("kind") for w in weapons if w.get("kind") in KNOWN_WEAPONS}
         mechs = [c for c in contacts if c.kind == "mech"]
         hunters = [c for c in mechs if c.dist < 170]
         visible = [c for c in hunters if c.clear]
@@ -305,8 +313,11 @@ class DuelBot(Bot):
             direction = angle(direction + 0.9 * math.sin(now * 1.3))
         action["aim"] = [direction, 0.0]
         if time.perf_counter() < until + 0.002:
+            boosting = action.pop("boost", False)
             self.combat(obs, pos, weapons, actual, stats, contacts, True, urgent, False, energy, 1.0, zone,
                         action, until + 0.002, terminal_burn, False, bool(hazards))
+            charging = any(f and w.get("kind") == "laser" for f, w in zip(action.get("fire", ()), weapons))
+            action["boost"] = bool(boosting) and not charging
         return action
 
     def farm_goal(self, obs, pos, contacts, zone):
@@ -337,7 +348,7 @@ class DuelBot(Bot):
         for item in seq(obs.get("pickups"))[:40]:
             item = obj(item)
             p, ident, kind = vec(item.get("pos"), 3), number(item.get("id"), None), item.get("kind")
-            if p is None or ident is None or kind in held or kind not in SECOND_RANK:
+            if p is None or ident is None or not isinstance(kind, str) or kind in held or kind not in SECOND_RANK:
                 continue
             if distance(pos, p) > reach - 0.3 or abs(p[2] - pos[2]) > 3.8:
                 continue
@@ -348,7 +359,7 @@ class DuelBot(Bot):
                     return
             for slot, w in enumerate(weapons):
                 k = w.get("kind")
-                if k in SECOND_RANK and SECOND_RANK[kind] > SECOND_RANK[k] and number(w.get("charge")) <= 0:
+                if isinstance(k, str) and k in SECOND_RANK and SECOND_RANK[kind] > SECOND_RANK[k] and number(w.get("charge")) <= 0:
                     action["take"], action["drop"] = ident, slot
                     return
 
