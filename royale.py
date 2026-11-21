@@ -8,9 +8,14 @@ policy; once it does we switch for the rest of the match.
 import mechfight as mf
 import example_bot as eb
 import duel_bot
+
+# Deterministic play: wide time caps so per-call work limits decide, not the wall clock.
+eb.PLAN_BUDGET_S = 0.010
+eb.ROUTE_SLICE_S = 0.004
 from example_bot import obj, seq, number, vec, distance, bearing, angle
 import math
 
+SEED = 1                    # the only source of randomness; a different value is a different draw
 FORCE_MODE = None           # None = detect; "practice" or "free-for-all" pins the policy
 GUARDED_OPENER = True       # squad play fights only mechs that attack or close on us
 
@@ -166,6 +171,7 @@ class Selective:
 
 class Royale:
     def __init__(self, hello):
+        duel_bot.SEED_SALT = SEED
         self.practice = duel_bot.DuelBot(hello)
         self.practice.guarded = GUARDED_OPENER
         self.ffa = Selective(hello)
