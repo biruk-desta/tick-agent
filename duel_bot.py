@@ -11,11 +11,11 @@ import mechfight as mf
 import example_bot as eb
 from example_bot import (Bot, Contact, Zone, ZERO, obj, seq, number, vec, limit, angle, bearing, distance, raised)
 
-P_STEADY_STRAFE = False
-P_SIGHTLINE = False
-P_FINISH = False
-P_EARLY_LASER = False
-P_REPAIR_HIDDEN = False
+P_STEADY_STRAFE = True
+P_SIGHTLINE = True
+P_FINISH = True
+P_EARLY_LASER = True
+P_REPAIR_HIDDEN = True
 
 SHELTER_SLICE_S = 0.006     # time caps are safety nets only: node and count limits should bind
 STEER_SLICE_S = 0.004
