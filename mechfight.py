@@ -37,8 +37,8 @@ except ImportError:  # Python < 3.11: only type checkers read it (annotations ar
     pass
 
 MAX_LINE = 64 * 1024
-INPUT_DRAIN_S = 0.006
-INPUT_FRAME_LIMIT = 64
+INPUT_DRAIN_S = 0.004
+INPUT_FRAME_LIMIT = 8
 DECISION_LIMIT_S = 0.014
 WRITE_RESERVE_S = 0.002
 INIT_LIMIT_S = 6.0
@@ -545,11 +545,6 @@ def _lines(fd):
         yield None, received if select.select([fd], [], [], 0)[0] else None
 
 
-def _looks_like_obs(raw):
-    head = raw[:96]
-    return b'"obs"' in head and b'"type"' in head
-
-
 def _decision(bot, obs, tick):
     action = bot.act(obs)
     if isinstance(action, dict) and action:
@@ -571,22 +566,7 @@ def run(make_bot: Any) -> None:
     latest = None
     batch_start = None
     frames = 0
-    pending = None  # newest observation line not yet decoded
     for raw, received in _lines(sys.stdin.fileno()):
-        if raw is not None and _looks_like_obs(raw):
-            # Observations are only decoded when they are the newest one queued.
-            if pending is None and latest is None:
-                batch_start = received
-            pending = raw
-            frames += 1
-            if frames < INPUT_FRAME_LIMIT and time.perf_counter() < batch_start + INPUT_DRAIN_S:
-                continue
-            raw, pending = pending, None
-        elif raw is None and pending is not None:
-            if (received is not None and frames < INPUT_FRAME_LIMIT
-                    and time.perf_counter() < batch_start + INPUT_DRAIN_S):
-                continue
-            raw, pending = pending, None
         if raw is not None:
             try:
                 msg = json.loads(raw)
@@ -604,24 +584,21 @@ def run(make_bot: Any) -> None:
                         log("Arena unavailable. Using the full policy without map routing.")
                     _send(stdout, b'{"type":"ready"}\n', time.perf_counter() + DECISION_LIMIT_S)
                 elif kind == "obs":
-                    if latest is None and batch_start is None:
+                    if latest is None:
                         batch_start = received
                     latest = msg
                 elif kind == "end":
                     return
         if latest is None:
-            if pending is None:
-                batch_start = None
-                frames = 0
             continue
-        if pending is not None or (received is not None and raw is None and frames < INPUT_FRAME_LIMIT
-                                   and time.perf_counter() < batch_start + INPUT_DRAIN_S):
+        if raw is not None:
+            frames += 1
+        if (received is not None and frames < INPUT_FRAME_LIMIT
+                and time.perf_counter() < batch_start + INPUT_DRAIN_S):
             continue
         obs = latest
         latest = None
         frames = 0
-        if batch_start is None:
-            batch_start = time.perf_counter()
         deadline = batch_start + DECISION_LIMIT_S
         tick = obs.get("tick")
         if type(tick) not in (int, float) or not -1e15 <= tick <= 1e15 or not math.isfinite(tick):
@@ -632,7 +609,6 @@ def run(make_bot: Any) -> None:
         if payload is None or len(payload) > frame_limit:
             payload = _encode(_fallback(obs, tick))
         _send(stdout, payload, deadline)
-        batch_start = None
 
 
 if __name__ == "__main__":
