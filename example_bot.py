@@ -13,7 +13,6 @@ import mechfight as mf
 
 
 # Policy settings. Live physics and weapon values are read from hello and observations.
-PLAY_MODE = "practice"  # Set to "free-for-all" to use the survive-first policy.
 PLAN_BUDGET_S = 0.006
 ROUTE_SLICE_S = 0.0015
 ROUTE_NODES_PER_TICK = 280
@@ -1844,5 +1843,171 @@ class PracticeBot(Bot):
         return action
 
 
+class MatchMode:
+    """Infer play mode from the private observation stream."""
+
+    def __init__(self, hello):
+        config = obj(hello.get("config"))
+        match = obj(config.get("match"))
+        self.tick_hz = max(1, number(match.get("tick_hz"), 20))
+        zone = obj(config.get("zone"))
+        phases = seq(zone.get("phases"))
+        self.first_shrink = number(obj(phases[0]).get("hold_s"), 60) if phases else 60
+        self.previous = {}
+        self.projectiles = {}
+        self.previous_time = None
+        self.alive = None
+        self.remote_deaths = 0
+        self.crossfire = 0
+        self.last_exchange = self.last_attack = self.squad_until = -math.inf
+        self.pairs = {}
+        self.mode = "undecided"
+
+    def update(self, obs):
+        if self.mode == "free-for-all":
+            return self.mode
+        obs = obj(obs)
+        me = obj(obs.get("self"))
+        pos = vec(me.get("pos"), 3)
+        now = number(obs.get("t"), number(obs.get("tick")) / self.tick_hz)
+        if pos is None or (self.previous_time is not None and now <= self.previous_time):
+            return self.mode
+        elapsed = now - self.previous_time if self.previous_time is not None else math.inf
+        actors, drones = {}, []
+        for row in seq(obs.get("mechs"))[:48]:
+            row = obj(row)
+            ident, loc = number(row.get("id"), -1), vec(row.get("pos"), 3)
+            if loc is None:
+                continue
+            if row.get("kind") == "mech" and 0 <= ident < 16 and ident != me.get("id"):
+                actors[ident] = (loc, vec(row.get("aim"), 2), number(row.get("hp"), None),
+                                 number(row.get("cubes"), None), seq(row.get("weapons")))
+            elif row.get("kind") == "npc" and number(row.get("hp"), 350) > 0:
+                drones.append(loc)
+        own_hits, own_kills = set(), set()
+        for row in seq(obs.get("events"))[:48]:
+            row = obj(row)
+            ident = number(row.get("target"), -1)
+            if row.get("type") in ("hit", "kill") and 0 <= ident < 16:
+                own_hits.add(ident)
+                if row["type"] == "kill":
+                    own_kills.add(ident)
+            if (row.get("type") == "damaged" and 0 <= number(row.get("by"), -1) < 16
+                    and row.get("weapon") in ("gun", "mortar", "laser", "lightning")):
+                self.last_attack = now
+        alive = number(obs.get("alive"), None)
+        if alive is not None:
+            if self.alive is not None and elapsed <= 0.25 and now < self.first_shrink:
+                # Early unattributed deaths are useful even outside vision. Any single
+                # death can be the zone or an NPC, so require a series.
+                self.remote_deaths += max(0, self.alive - alive - len(own_kills))
+            self.alive = alive
+
+        zone = obj(obs.get("zone"))
+        center, radius = vec(zone.get("center"), 2), number(zone.get("radius"), 0)
+        beams = []
+        for row in seq(obs.get("beams"))[:24]:
+            row = obj(row)
+            path = seq(row.get("path"))
+            if (0 <= number(row.get("by"), -1) < 16 and row.get("by") != me.get("id")
+                    and row.get("kind") in ("laser", "lightning")
+                    and len(path) >= 2 and number(row.get("age")) <= elapsed + 0.051):
+                points = [vec(point, 3) for point in path[1:4]]
+                beams.extend((row["by"], point) for point in points if point is not None)
+        fire = [(row.get("kind"), heading) for item in seq(obs.get("sounds"))[:40]
+                if (row := obj(item)) and (heading := number(row.get("bearing"), None)) is not None
+                and number(row.get("age"), 99) < 0.25]
+        projectiles = {}
+        for row in seq(obs.get("projectiles"))[:48]:
+            row = obj(row)
+            ident = number(row.get("id"), None)
+            if ident is not None and row.get("kind") == "gun":
+                start, velocity = vec(row.get("pos"), 3), vec(row.get("vel"), 3)
+                if start is not None and velocity is not None:
+                    projectiles[ident] = start, velocity
+        crossfire = 0
+        if elapsed <= 0.25 and center is not None:
+            for ident, (loc, _, hp, cubes, _) in actors.items():
+                old = self.previous.get(ident)
+                if (not old or hp is None or old[2] is None or old[2] - hp < 20
+                        or ident in own_hits or old[3] != cubes or distance(loc, center) > radius - 6
+                        or distance(old[0], center) > radius - 6):
+                    continue
+                scale = 1 + 0.05 * limit(number(cubes), 0, 100)
+                if any(source != ident and distance(end, loc) <= 2.5 * scale + 2
+                       and loc[2] - 1 <= end[2] <= loc[2] + 9 * scale + 1 for source, end in beams):
+                    crossfire = max(crossfire, 2)
+                    continue
+                # Gunfire only corroborates a large HP fall with a plausible,
+                # distinguishable shooter. Neither aim nor audio identifies a hit alone.
+                if old[2] - hp < 34 or any(distance(loc, npc) < 115 for npc in drones):
+                    continue
+                for projectile, (start, velocity) in self.projectiles.items():
+                    if projectile in projectiles or distance(start, loc) > 80:
+                        continue
+                    dx, dy = loc[0] - start[0], loc[1] - start[1]
+                    vx, vy, vz = velocity
+                    speed_sq = vx * vx + vy * vy
+                    if speed_sq < 1:
+                        continue
+                    flight = (dx * vx + dy * vy) / speed_sq
+                    if (0 <= flight <= elapsed + 0.05
+                            and math.hypot(dx - flight * vx, dy - flight * vy) <= 2.5 * scale + 2
+                            and loc[2] - 1 <= start[2] + flight * vz <= loc[2] + 9 * scale + 1):
+                        crossfire = max(crossfire, 2)
+                        break
+                for source, (origin, aim, _, _, weapons) in actors.items():
+                    if (source == ident or aim is None or distance(origin, loc) > 225
+                            or abs(angle(aim[0] - bearing(origin, loc))) > 0.20
+                            or abs(angle(aim[0] - bearing(origin, pos))) < 0.42):
+                        continue
+                    if any(kind in weapons and abs(angle(heading - bearing(pos, origin))) < 0.34
+                           for kind, heading in fire):
+                        crossfire = max(crossfire, 1)
+                        break
+        self.previous, self.previous_time = actors, now
+        self.projectiles = projectiles
+        if crossfire and now - self.last_exchange > 0.19:
+            self.crossfire += crossfire
+            self.last_exchange = now
+            self.squad_until = -math.inf
+        if self.crossfire >= 3 or self.remote_deaths >= 3:
+            self.mode = "free-for-all"
+            return self.mode
+
+        # Two close, unengaged rivals ignoring one another during a sustained
+        # attack on us is positive squad evidence. Quiet time alone adds nothing.
+        next_pairs = {}
+        if elapsed <= 0.25 and now - self.last_attack <= 2.8 and not (self.crossfire or self.remote_deaths):
+            nearby = [ident for ident, (loc, aim, hp, _, weapons) in actors.items()
+                      if aim is not None and hp is not None and hp > 0 and weapons and distance(loc, pos) <= 145]
+            for i, a in enumerate(nearby):
+                for b in nearby[i + 1:]:
+                    u, v = actors[a], actors[b]
+                    if (distance(u[0], v[0]) > 43 or abs(u[0][2] - v[0][2]) > 6
+                            or abs(angle(u[1][0] - bearing(u[0], v[0]))) < 0.65
+                            or abs(angle(v[1][0] - bearing(v[0], u[0]))) < 0.65):
+                        continue
+                    pair = min(a, b), max(a, b)
+                    next_pairs[pair] = self.pairs.get(pair, 0) + elapsed
+        self.pairs = next_pairs
+        if now >= 8 and (any(seconds >= 6 for seconds in next_pairs.values())
+                         or sum(seconds >= 3.5 for seconds in next_pairs.values()) >= 2):
+            self.squad_until = now + 25
+        self.mode = ("practice" if now < self.squad_until and not self.remote_deaths else "undecided")
+        return self.mode
+
+
+class AutoBot(PracticeBot):
+    def __init__(self, hello):
+        super().__init__(hello)
+        self.detector = MatchMode(hello)
+
+    def act(self, obs):
+        if self.detector.update(obs) == "practice":
+            return super().act(obs)
+        return Bot.act(self, obs)
+
+
 if __name__ == "__main__":
-    mf.run(PracticeBot if PLAY_MODE == "practice" else Bot)
+    mf.run(AutoBot)
