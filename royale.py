@@ -17,7 +17,7 @@ eb.PLAN_BUDGET_S = 0.010
 eb.ROUTE_SLICE_S = 0.004
 from example_bot import obj, seq, number, vec, distance, bearing, angle, limit, raised
 
-SEED = 1                    # the only source of randomness; a different value is a different draw
+SEED = 4                    # the only source of randomness; a different value is a different draw
 FORCE_MODE = None           # None = detect; "practice" or "free-for-all" pins the policy
 GUARDED_OPENER = True       # squad play fights only mechs that attack or close on us
 PAUSE_MED_MS = 8.0
