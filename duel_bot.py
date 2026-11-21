@@ -38,7 +38,7 @@ FIRST_WEAPON_DETOUR_M = 160.0   # walk this far for a first laser or lightning
 LASER_DETOUR_M = 90.0           # and this far to add a laser
 # These three switches affect only the guarded practice instance in royale.py.
 # The unguarded DuelBot used by Selective's error fallback retains its old policy.
-PRACTICE_FOCUS_COMMIT = False
+PRACTICE_FOCUS_COMMIT = True
 PRACTICE_RANGE_DISCIPLINE = False
 PRACTICE_FIRE_CYCLE = False
 PRACTICE_PLAN_S = 0.008
