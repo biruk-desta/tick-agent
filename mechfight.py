@@ -1,24 +1,24 @@
-"""mechfight/1 bot wrapper. One file, standard library only (Python 3.9+): copy it next to your bot.
 
-    import mechfight as mf
 
-    class Bot:
-        def __init__(self, hello: mf.Hello): ...
-        def act(self, obs: mf.Observation) -> mf.Action:
-            return {"move": [1, 0]}
 
-    mf.run(Bot)
 
-What run() does for you (protocol.md section 2):
-- answers `hello` with `ready` (your class's `name`), then calls act() for each observation;
-- if observations queue up, answers the newest one in a bounded input batch;
-- sets `tick` on your action (you don't have to);
-- bounds incoming lines and decision time, with map-free steering on failure;
-- exits on `end`.
 
-The types below are generated from mechfight.schema.json; they are TypedDicts, so at runtime every
-message is a plain dict. Fields may be added to the protocol: read them with .get() if unsure.
-"""
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 from __future__ import annotations
 
 import json
@@ -35,7 +35,7 @@ from typing import Any, Dict, List, Literal, Optional, TypedDict, Union
 
 try:
     from typing import NotRequired
-except ImportError:  # Python < 3.11: only type checkers read it (annotations are lazy above)
+except ImportError:  
     pass
 
 MAX_LINE = 64 * 1024
@@ -44,18 +44,18 @@ INPUT_FRAME_LIMIT = 8
 DECISION_LIMIT_S = 0.014
 WRITE_RESERVE_S = 0.002
 INIT_LIMIT_S = 6.0
-pause_ms = (None, None)  # Median and minimum of the first ten eligible gaps.
+pause_ms = (None, None)  
 
-# --- generated from mechfight.schema.json: do not edit ---
-# Every message a bot sends the server.
+
+
 BotMessage = Union["Ready", "Action"]
-# A color: "#rgb" or "#rrggbb". Anything else is replaced by your mech's color.
+
 Color = str
-# cookoff: laser on a mortar carrier. short: lightning on a laser carrier. concuss: any mortar blast.
+
 EffectName = Literal["cookoff", "short", "concuss"]
 GameEvent = Union["DamagedEvent", "HitEvent", "EffectEvent", "DropEvent", "KillEvent", "PickupEvent", "UpgradeEvent", "TookEvent", "DroppedEvent", "TakeFailedEvent"]
 MechStats = Dict[str, float]
-# Every message the server sends a bot.
+
 ServerMessage = Union["Hello", "Observation", "EndMsg"]
 Vec2 = List[float]
 Vec3 = List[float]
@@ -63,23 +63,23 @@ WeaponKind = Literal["gun", "mortar", "laser", "lightning"]
 
 class Action(TypedDict):
     type: NotRequired[Literal["action"]]
-    # echo the observation tick; stale answers are dropped
+    
     tick: float
-    # desired horizontal direction in world frame, length <= 1
+    
     move: NotRequired[Vec2]
     boost: NotRequired[bool]
     jump: NotRequired[bool]
-    # desired [yaw, pitch]; the torso slews toward it at turn_rate
+    
     aim: NotRequired[Vec2]
     fire: NotRequired[List[bool]]
     reload: NotRequired[bool]
-    # index into the current offer's choices
+    
     pick: NotRequired[float]
-    # id of a weapon pickup within loot.pickup_radius
+    
     take: NotRequired[float]
-    # slot (0/1) to empty: with `take`, the slot the new weapon replaces; alone, just drops it
+    
     drop: NotRequired[float]
-    # debug drawing, shown only to your team; never affects the match
+    
     debug: NotRequired[DebugDraw]
 
 class ActorObs(TypedDict):
@@ -91,13 +91,13 @@ class ActorObs(TypedDict):
     hp: NotRequired[float]
     max_hp: NotRequired[float]
     cubes: NotRequired[float]
-    # weapons held (empty slots omitted)
+    
     weapons: NotRequired[List[WeaponKind]]
-    # laser charging (telegraph)
+    
     charging: NotRequired[bool]
 
 class BeamObs(TypedDict):
-    """an instant shot (laser beam or lightning arc) by another mech, from its muzzle along `path`"""
+    
     by: float
     kind: Literal["laser", "lightning"]
     path: List[Vec3]
@@ -144,7 +144,7 @@ class ConfigLoot(TypedDict):
     weights: ConfigLootWeights
 
 class ConfigDrops(TypedDict):
-    """Supply drops (optional: absent = none)."""
+    
     times: List[float]
     fall_s: float
     radius: float
@@ -170,29 +170,29 @@ class Config(TypedDict):
     crates: Dict[str, float]
     loot: ConfigLoot
     npc: Dict[str, float]
-    # Supply drops (optional: absent = none).
+    
     drops: NotRequired[ConfigDrops]
     zone: ConfigZone
     replay: Dict[str, float]
-    # Caps on action.debug: the server silently cuts each decision's drawing to these.
+    
     debug: DebugCaps
     upgrades: List[UpgradeDef]
 
 class DamagedEvent(TypedDict):
-    """You took damage."""
+    
     type: Literal["damaged"]
     amount: float
-    # gun, mortar, laser, lightning, npc or zone
+    
     weapon: str
-    # world-frame yaw toward the source (null for the zone)
+    
     bearing: Optional[float]
-    # attacker id (null for the zone)
+    
     by: Optional[float]
-    # it came from outside your front arc (x mech.rear_mult)
+    
     rear: NotRequired[bool]
 
 class DebugCaps(TypedDict):
-    """Caps on the debug drawing a bot may attach to an action."""
+    
     max_lines: float
     max_points: float
     max_text: float
@@ -202,53 +202,53 @@ class DebugCaps(TypedDict):
     hold_s: float
 
 class DebugDraw(TypedDict):
-    """Debug drawing for one decision. Stays on screen until your next decision that carries `debug`, or `debug.hold_s` seconds, whichever comes first; send `{}` to clear it early. The server truncates to the `[debug]` caps in hello.config (item counts, text length, bytes per decision, bytes per match) without telling you. It is recorded to a file only your team can download, never to the public replay, and has no effect on the match."""
+    
     lines: NotRequired[List[DebugLine]]
     points: NotRequired[List[DebugPoint]]
     text: NotRequired[List[DebugText]]
-    # one short status line drawn above your mech
+    
     label: NotRequired[str]
 
 class DebugLine(TypedDict):
-    """A line segment from world point `a` to `b` (x east, y north, z up, meters)."""
+    
     a: Vec3
     b: Vec3
     color: NotRequired[Color]
 
 class DebugPoint(TypedDict):
-    """A dot at a world point. `size` is its radius in screen pixels (1..12, default 4)."""
+    
     at: Vec3
     color: NotRequired[Color]
     size: NotRequired[float]
 
 class DebugText(TypedDict):
-    """A text label. With `at`, drawn at that world point; without, stacked above your mech."""
+    
     text: str
     at: NotRequired[Vec3]
     color: NotRequired[Color]
 
 class DropEvent(TypedDict):
-    """You captured supply drop `id`; `cubes` is your new total."""
+    
     type: Literal["drop"]
     id: float
     cubes: float
 
 class DropObs(TypedDict):
-    """A supply drop. Known to every mech from the moment it is called, like the zone."""
+    
     id: float
     pos: Vec3
-    # stand inside this, alone, for capture_s
+    
     radius: float
-    # seconds until it can be captured (0 = on the ground)
+    
     lands_in: float
     capture_s: float
-    # seconds the current holder has banked
+    
     progress: float
-    # mech currently capturing
+    
     holder: Optional[float]
 
 class DroppedEvent(TypedDict):
-    """A weapon left your `slot` and lies on the ground as pickup `id`."""
+    
     type: Literal["dropped"]
     id: float
     kind: WeaponKind
@@ -260,7 +260,7 @@ class Effect(TypedDict):
     add: NotRequired[float]
 
 class EffectEvent(TypedDict):
-    """A signature effect landed on you."""
+    
     type: Literal["effect"]
     effect: EffectName
     by: Optional[float]
@@ -277,15 +277,15 @@ class HelloMap(TypedDict):
 class Hello(TypedDict):
     type: Literal["hello"]
     protocol: Literal["mechfight/1"]
-    # your mech id, 0..15
+    
     slot: float
-    # per-bot seed, use it for your own RNG to stay reproducible
+    
     seed: float
     map: HelloMap
     config: Config
 
 class HitEvent(TypedDict):
-    """You damaged `target` (a mech, NPC or crate id)."""
+    
     type: Literal["hit"]
     target: float
     amount: float
@@ -299,32 +299,32 @@ class ItemObs(TypedDict):
     hp: NotRequired[float]
 
 class KillEvent(TypedDict):
-    """You killed a mech."""
+    
     type: Literal["kill"]
     target: float
 
 class Observation(TypedDict):
     type: Literal["obs"]
     tick: float
-    # match time, seconds
+    
     t: float
-    # mechs alive (not NPCs)
+    
     alive: float
     self: SelfObs
-    # visible mechs and NPCs
+    
     mechs: List[ActorObs]
     projectiles: List[ProjectileObs]
     crates: List[ItemObs]
     cubes: List[ItemObs]
-    # visible weapons on the ground
+    
     pickups: List[PickupObs]
     sounds: List[SoundObs]
-    # laser beams and lightning arcs by other mechs that you saw (any point of the path in view) since your last observation
+    
     beams: List[BeamObs]
     events: List[GameEvent]
     zone: ZoneObs
     offer: Optional[Offer]
-    # supply drops called or on the ground
+    
     drops: List[DropObs]
 
 class Offer(TypedDict):
@@ -338,12 +338,12 @@ class OfferChoice(TypedDict):
     desc: str
 
 class PickupEvent(TypedDict):
-    """You picked up a cube; `cubes` is your new total."""
+    
     type: Literal["pickup"]
     cubes: float
 
 class PickupObs(TypedDict):
-    """A weapon lying on the ground. Take it with the `take` action."""
+    
     id: float
     kind: WeaponKind
     pos: Vec3
@@ -362,7 +362,7 @@ class SelfObs(TypedDict):
     id: float
     pos: Vec3
     vel: Vec3
-    # [yaw, pitch] actual (slewed) aim
+    
     aim: Vec2
     hp: float
     max_hp: float
@@ -371,10 +371,10 @@ class SelfObs(TypedDict):
     grounded: bool
     cubes: float
     upgrades: List[str]
-    # null = empty slot
+    
     weapons: List[Optional[WeaponObs]]
     in_zone: bool
-    # your current [mech] numbers after upgrades
+    
     stats: Dict[str, float]
 
 class SoundObs(TypedDict):
@@ -384,13 +384,13 @@ class SoundObs(TypedDict):
     age: float
 
 class TakeFailedEvent(TypedDict):
-    """Your `take` didn't happen."""
+    
     type: Literal["take_failed"]
     id: float
     reason: Literal["gone", "range", "have", "full", "busy"]
 
 class TookEvent(TypedDict):
-    """Your `take` succeeded: pickup `id` is now in `slot`."""
+    
     type: Literal["took"]
     id: float
     kind: WeaponKind
@@ -405,21 +405,21 @@ class UpgradeDef(TypedDict):
     effects: List[Effect]
 
 class UpgradeEvent(TypedDict):
-    """An upgrade was applied."""
+    
     type: Literal["upgrade"]
     id: str
 
 class WeaponObs(TypedDict):
     kind: WeaponKind
-    # seconds until it can fire again
+    
     cooldown: float
-    # gun only
+    
     ammo: NotRequired[float]
-    # gun only: seconds of reload left (0 = not reloading)
+    
     reload: NotRequired[float]
-    # laser only: seconds charged so far (0 = not charging); it fires at weapons.laser.charge, or on release after min_charge
+    
     charge: NotRequired[float]
-    # this weapon's [weapons.<kind>] numbers after upgrades
+    
     stats: Dict[str, float]
 
 class ZoneObs(TypedDict):
@@ -427,7 +427,7 @@ class ZoneObs(TypedDict):
     radius: float
     next_center: Vec2
     next_radius: float
-    # match time (s) the current shrink starts (or started)
+    
     shrink_start: float
     shrink_end: float
     dps: float
@@ -437,7 +437,7 @@ class ZonePhase(TypedDict):
     shrink_s: float
     radius: float
     dps: float
-# --- end generated ---
+
 
 
 class DeadlineExceeded(BaseException):
@@ -495,7 +495,7 @@ def _fallback(obs, tick):
 
 
 def log(*args: Any) -> None:
-    """print() to stderr: stdout is the protocol. Your team sees stderr after each match."""
+    
     print(*args, file=sys.stderr, flush=True)
 
 
@@ -504,8 +504,8 @@ def _encode(msg):
 
 
 def _send(fd, payload, deadline):
-    # Frames fit in PIPE_BUF, so the unbuffered write either flushes a whole line
-    # or leaves stdout untouched. A slow reader cannot hold up later decisions.
+    
+    
     while True:
         try:
             return time.perf_counter() if os.write(fd, payload) == len(payload) else None
@@ -517,20 +517,22 @@ def _send(fd, payload, deadline):
             return
 
 
-def _lines(fd):
+def _lines(fd, *, complete_timestamp=False):
     pending = bytearray()
     started = None
     discarding = False
     while True:
         chunk = os.read(fd, 32768)
         if not chunk:
-            yield None, None
+            if not complete_timestamp:
+                yield None, None
             return
         received = time.perf_counter()
         parts = chunk.split(b"\n")
         for part in parts[:-1]:
             if not discarding and len(pending) + len(part) <= MAX_LINE:
-                yield bytes(pending) + part, started if started is not None else received
+                timestamp = received if complete_timestamp or started is None else started
+                yield bytes(pending) + part, timestamp
             pending.clear()
             started = None
             discarding = False
@@ -543,8 +545,48 @@ def _lines(fd):
             else:
                 pending.clear()
                 discarding = True
-        # Give the caller a deadline check even in the middle of an oversized line.
+        
         yield None, received if select.select([fd], [], [], 0)[0] else None
+
+
+def _observation_tick(obs, default_tick):
+    tick = obs.get("tick")
+    valid = type(tick) in (int, float) and -1e15 <= tick <= 1e15
+    return (tick if valid else default_tick), valid
+
+
+class _QueuedInput:
+    def __init__(self, fd, lines, default_tick):
+        self.fd = fd
+        self.lines = lines
+        self.default_tick = default_tick
+        self.buffered = True
+        self.count = 0
+        self.latest = None
+
+    def drain(self):
+        while self.fd is not None and (self.buffered or select.select([self.fd], [], [], 0)[0]):
+            item = next(self.lines, None)
+            if item is None:
+                self.fd = None
+                return
+            raw, received = item
+            self.buffered = received is not None
+            if raw is None:
+                continue
+            try:
+                msg = json.loads(raw)
+            except (ValueError, RecursionError):
+                continue
+            if isinstance(msg, dict):
+                kind = msg.get("type")
+                if kind == "end":
+                    self.fd = None
+                elif kind == "obs":
+                    tick, valid = _observation_tick(msg, self.default_tick)
+                    self.latest = msg, tick, valid, received
+                    self.count += 1
+                    yield msg, raw + b"\n", tick, received
 
 
 def _encode_action(action, obs, pause_show):
@@ -557,21 +599,21 @@ def _encode_action(action, obs, pause_show):
     return _encode(action)
 
 
-def _decision(bot, obs, tick, pause_show):
-    action = bot.act(obs)
+def _decision(bot, obs, tick, pause_show, *args):
+    action = bot.act(obs, *args)
     if isinstance(action, dict) and action:
         return _encode_action({**action, "tick": tick}, obs, pause_show)
     return None
 
 
-def run(make_bot: Any, *, pause_show: bool = False, practice_wire: bool = False) -> None:
-    """Run a bot until end or EOF, with a watchdog around each decision."""
+def run(make_bot: Any, *, pause_show: bool = False, practice_wire: bool = False,
+        raw_wire: Any = None) -> None:
+    
     global pause_ms
     pause_ms = (None, None)
-    # Each process runs a single match. The JSON and policy state are acyclic.
     gc.disable()
     signal.signal(signal.SIGALRM, _interrupt)
-    stdout = sys.stdout.fileno()
+    stdin, stdout = sys.stdin.fileno(), sys.stdout.fileno()
     os.set_blocking(stdout, False)
     frame_limit = os.fpathconf(stdout, "PC_PIPE_BUF")
     bot = None
@@ -585,7 +627,8 @@ def run(make_bot: Any, *, pause_show: bool = False, practice_wire: bool = False)
     batch_start = None
     frames = 0
     default_observation = False
-    for raw, received in _lines(sys.stdin.fileno()):
+    lines = _lines(stdin, complete_timestamp=raw_wire is not None)
+    for raw, received in lines:
         if raw is not None:
             try:
                 msg = json.loads(raw)
@@ -602,6 +645,8 @@ def run(make_bot: Any, *, pause_show: bool = False, practice_wire: bool = False)
                 kind = msg.get("type")
                 if kind == "hello" and not handshaken:
                     handshaken = True
+                    if raw_wire is not None:
+                        raw_wire.start(raw + b"\n")
                     config = msg.get("config")
                     match = config.get("match") if isinstance(config, dict) else None
                     stride = match.get("decide_every") if isinstance(match, dict) else None
@@ -609,10 +654,10 @@ def run(make_bot: Any, *, pause_show: bool = False, practice_wire: bool = False)
                         decide_every = stride
                     bot = _watched(INIT_LIMIT_S, make_bot, msg)
                     if bot is None:
-                        log("Bot initialization failed. Using map-free steering.")
+                        log("Bot initialization failed.")
                     load_map = getattr(bot, "load_map", None)
                     if load_map is not None and _watched(INIT_LIMIT_S, load_map) is None:
-                        log("Arena unavailable. Using the full policy without map routing.")
+                        log("Arena unavailable.")
                     _send(stdout, b'{"type":"ready"}\n', time.perf_counter() + DECISION_LIMIT_S)
                 elif kind == "obs":
                     queued = latest is not None
@@ -627,17 +672,30 @@ def run(make_bot: Any, *, pause_show: bool = False, practice_wire: bool = False)
             continue
         if raw is not None:
             frames += 1
-        if (received is not None and frames < INPUT_FRAME_LIMIT
+        if (raw_wire is None and received is not None and frames < INPUT_FRAME_LIMIT
                 and time.perf_counter() < batch_start + INPUT_DRAIN_S):
             continue
         obs = latest
         latest = None
         frames = 0
         deadline = batch_start + DECISION_LIMIT_S
-        tick = obs.get("tick")
-        valid_tick = type(tick) in (int, float) and -1e15 <= tick <= 1e15
-        if not valid_tick:
-            tick = last_tick + 2
+        tick, valid_tick = _observation_tick(obs, last_tick + 2)
+        input_queue = None
+        if raw_wire is not None:
+            input_queue = _QueuedInput(stdin, lines, last_tick + 2)
+            if bot is not None:
+                payload, deadline = raw_wire.decide(bot, obs, raw + b"\n", tick, batch_start,
+                                                    frame_limit, pause_show, input_queue)
+            else:
+                payload = None
+                for _ in input_queue.drain():
+                    pass
+            if input_queue.latest is not None:
+                obs, tick, valid_tick, batch_start = input_queue.latest
+                observations += input_queue.count
+                queued = True
+                if bot is None:
+                    deadline = batch_start + DECISION_LIMIT_S
         if gaps is not None:
             now = obs.get("t")
             if type(now) in (int, float):
@@ -651,9 +709,10 @@ def run(make_bot: Any, *, pause_show: bool = False, practice_wire: bool = False)
                 elif now >= 3.0:
                     gaps = None
         last_tick = tick
-        remaining = deadline - WRITE_RESERVE_S - time.perf_counter()
-        payload = (_watched(remaining, _decision, bot, obs, tick, pause_show)
-                   if bot is not None and remaining > 0 and not default_observation else None)
+        if raw_wire is None:
+            remaining = deadline - WRITE_RESERVE_S - time.perf_counter()
+            payload = (_watched(remaining, _decision, bot, obs, tick, pause_show)
+                       if bot is not None and remaining > 0 and not default_observation else None)
         if payload is None or len(payload) > frame_limit:
             if default_observation:
                 payload = _encode({"tick": tick})
@@ -661,6 +720,8 @@ def run(make_bot: Any, *, pause_show: bool = False, practice_wire: bool = False)
                 payload = _encode_action(_fallback(obs, tick), obs, pause_show)
         sent = _send(stdout, payload, deadline)
         last_sent = sent if valid_tick else None
+        if input_queue is not None and input_queue.fd is None:
+            return
 
 
 if __name__ == "__main__":

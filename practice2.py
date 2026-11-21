@@ -1,4 +1,4 @@
-"""Practice policy. It owns its tracking, navigation and random stream."""
+
 
 from array import array
 from collections import deque
@@ -61,11 +61,11 @@ def seed_words(seed, first_shift, second_shift):
 
 
 def multiply_rng_polynomials(lhs, rhs):
-    """Convolve modulo 2**64 and x**607 - x**334 - 1.
+    
 
-    A convolution coefficient fits in 144 bits, so packed integer multiplication
-    computes all coefficients without carry between them.
-    """
+
+
+
     width = 18
     left = int.from_bytes(b"".join(v.to_bytes(width, "little") for v in lhs), "little")
     right = int.from_bytes(b"".join(v.to_bytes(width, "little") for v in rhs), "little")
@@ -79,7 +79,7 @@ def multiply_rng_polynomials(lhs, rhs):
 
 @lru_cache(maxsize=1)
 def rng_seed_mix():
-    """Generate the Go math/rand seed mix with a recurrence jump."""
+    
     state = seed_words(1, 20, 10)
     first = []
     for i in range(RNG_LENGTH):
@@ -106,7 +106,7 @@ def rng_seed_mix():
 
 
 class RandomStream:
-    """The seeded Go math/rand stream, implemented using Python integers."""
+    
 
     def __init__(self, seed):
         seed = ((int(seed) + (1 << 63)) & WORD_MASK) - (1 << 63)
@@ -212,7 +212,7 @@ class Prism:
 
 
 class PracticeMap:
-    """Exact shot geometry, plus the two rasters used by the practice policy."""
+    
 
     def __init__(self, directory=None, *, world=None, heights=None):
         if world is None:
@@ -355,7 +355,7 @@ class PracticeMap:
                 ty = (8 * (j + (dy > 0)) + y0 - y) / dy if dy else INF
                 edge = min(1, min(tx if tx > t else INF, ty if ty > t else INF) + 1e-6)
                 if z + dz * edge > peak:
-                    # The epsilon reaches the adjoining block in either direction.
+                    
                     t, at_z = edge, z + dz * edge
                     if t >= 1:
                         return True
@@ -493,7 +493,7 @@ class PracticeMap:
                                         if mask & (1 << i)) for mask in range(256))
 
     def build_landings(self):
-        """Grow the main component in grid order, including through solids."""
+        
         w, h = self.w, self.h
         landings = array("i", [-1]) * (w * h)
         frontier = []
@@ -561,7 +561,7 @@ class PracticeMap:
         return True
 
     def exposure(self, point, ceiling=INF):
-        """Accumulate raster exposure, stopping when it cannot win a score comparison."""
+        
         x, y = point
         left, right, bottom, top = self.left, self.right, self.bottom, self.top
         z = self.surface(x, y) + 7
@@ -586,7 +586,7 @@ class PracticeMap:
 
 
 class Route:
-    """Weighted A* with the practice policy's strict heap ordering."""
+    
 
     def __init__(self, arena, start, goal):
         self.arena, self.goal = arena, goal
@@ -1223,7 +1223,7 @@ class Practice:
             threats = sorted(threats, key=lambda row: row[0])[:4]
         eyes = [eye for _, eye in threats]
         clear = self.movement_ray
-        # Leave room for the combat sampler if this search cannot find cover.
+        
         cover_deadline = min(self.work_deadline, time.perf_counter() + 0.0018)
 
         def covered(point):
@@ -1390,7 +1390,7 @@ class Practice:
             x, y, z = origin
             vx, vy, vz = velocity
             dx, dy = vx * 0.05, vy * 0.05
-            # A shell farther away even after the longest eligible flight cannot hit us.
+            
             if distance(origin, pos) > 2.5 * math.hypot(vx, vy) + reach:
                 continue
             for step in range(50):

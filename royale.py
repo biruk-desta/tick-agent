@@ -1,26 +1,33 @@
-"""Entry point: detect at run time whether this match is the practice squad or a free-for-all.
 
-Practice: 15 house bots on one squad never fight each other, so before the late zone the
-only mechs that die are the ones we kill. Free-for-all: other mechs die without us, and we
-see beams from one mech ending on another. Until the evidence arrives we play the practice
-policy; once it does we switch for the rest of the match.
-"""
+
+
+
+
+
+
 import mechfight as mf
 import example_bot as eb
 import duel_bot
+import json
 import math
+import os
+import select
+import subprocess
+import threading
 import time
+from collections import deque
 from typing import NamedTuple
 
-# Deterministic play: wide time caps so per-call work limits decide, not the wall clock.
 eb.PLAN_BUDGET_S = 0.010
 eb.ROUTE_SLICE_S = 0.004
 from example_bot import obj, seq, number, vec, distance, bearing, angle, limit, raised
 
-SEED = 6                    # practice random stream seed
-P_DRIVER = 3                # 1 = legacy practice, 2 = practice2, 3 = practice3
-FORCE_MODE = None           # None = detect; "practice" or "free-for-all" pins the policy
-GUARDED_OPENER = True       # squad play fights only mechs that attack or close on us
+SEED = 6                    
+P_DRIVER = 4
+P4_SALT = 0
+P4_DEADLINE_MS = 30
+FORCE_MODE = None           
+GUARDED_OPENER = True       
 PAUSE_MED_MS = 8.0
 PAUSE_MIN_MS = 4.0
 PAUSE_SHOW = False
@@ -90,8 +97,6 @@ def distance_sq(a, b):
 
 
 class Detector:
-    """Latch on the first pause, unexplained death, HP loss, crossfire or beam signal."""
-
     def __init__(self, hello):
         self.slot = number(hello.get("slot"), -1)
         self.start_alive = None
@@ -100,7 +105,6 @@ class Detector:
         self.seen_hp = {}
         self.latest_attacker = None
         self.ffa = False
-        self.reason = ""
         self.score = 0.0
 
     def other_hp_drop(self, obs, events):
@@ -142,7 +146,7 @@ class Detector:
             return True
         g_med, g_min = mf.pause_ms
         if USE_PAUSE and now >= 1.2 and g_med is not None and g_med > PAUSE_MED_MS and g_min > PAUSE_MIN_MS:
-            self.ffa, self.reason = True, f"pause {g_med:.1f}/{g_min:.1f} ms"
+            self.ffa = True
             return True
         events = [obj(event) for event in seq(obs.get("events"))[:200]]
         self.kills += sum(event.get("type") == "kill" for event in events)
@@ -154,16 +158,16 @@ class Detector:
             others = (self.start_alive - alive) - self.kills
             self.score = others
             if (others >= 2 and dps <= 35) or (others >= 3 and dps <= 100):
-                self.ffa, self.reason = True, f"{others} deaths not ours at {now:.1f}s (dps {dps:.0f})"
+                self.ffa = True
                 return True
             if USE_E and others >= 1 and now < E_WINDOW_S:
-                self.ffa, self.reason = True, f"death not ours before {E_WINDOW_S:g}s at {now:.1f}s"
+                self.ffa = True
                 return True
         if USE_R and self.other_hp_drop(obs, events):
-            self.ffa, self.reason = True, f"other mech lost 45 HP at {now:.1f}s"
+            self.ffa = True
             return True
         if USE_H2 and self.kills == 0 and self.two_attackers(events, now):
-            self.ffa, self.reason = True, f"two mechs hit us before our first kill at {now:.1f}s"
+            self.ffa = True
             return True
         beams = seq(obs.get("beams"))[:32]
         if not beams:
@@ -195,7 +199,7 @@ class Detector:
                 if not self.beam_times or now - self.beam_times[-1] > 1.0:
                     self.beam_times.append(now)
         if len(self.beam_times) >= 2:
-            self.ffa, self.reason = True, f"laser beams mech-to-mech at {self.beam_times[:2]}"
+            self.ffa = True
         return self.ffa
 
 
@@ -274,7 +278,7 @@ class Selective(eb.Bot):
         self.pickup_memory_cursor = 0
 
     def record(self, obs, pos, now):
-        """Update bounded observation history without running any policy or map queries."""
+        
         kills = set()
         for raw in seq(obs.get("events"))[:200]:
             event = obj(raw)
@@ -480,7 +484,7 @@ class Selective(eb.Bot):
             weight = FFA_WEDGE_COST * (FFA_LASER_MULT if "laser" in seen.weapons else 1)
             self.observers[ident] = Observer(seen.pos, raised(seen.pos, eye * scale), facing, weight)
         if FFA_NOT_NEAREST:
-            # Only destinations beyond this radius give the observer a closer rival.
+            
             points = [enemy.pos for enemy in self.observers.values()]
             self.nearest_thresholds = tuple(
                 (point, min((distance_sq(point, other) for j, other in enumerate(points) if i != j),
@@ -523,7 +527,7 @@ class Selective(eb.Bot):
                 ray_budget -= 1
                 if not self.arena.clear_ray(eye, chest):
                     continue
-            # A candidate with untested rays cannot claim cover.
+            
             cost += weight
         if steering:
             self.steering_rays = ray_budget
@@ -540,7 +544,7 @@ class Selective(eb.Bot):
         return wedge - self.nearest_cost(point)
 
     def line_to_self(self, ident, enemy, pos):
-        # Two rays per known opponent at most, even if the route changes during steering.
+        
         if ident not in self.self_los:
             self.self_los[ident] = (self.arena is None
                                     or self.arena.clear_ray(enemy.eye, raised(pos, self.body_height * 0.5))
@@ -630,7 +634,7 @@ class Selective(eb.Bot):
             outside = max(0, distance(point, zone.next_center) - zone.next_radius + 10)
             cost = 0 if take else d + max(0, climb - 4) * 2 + outside * 0.55
             option = priority, cost, ident, point, take
-            # A map route can bend around a sighting. Its actual legs are checked in route().
+            
             start = point if FFA_PICKUP_TAPER and self.arena is not None else pos
             if zone.gap(point, 0 if take else d / 9 + 4) > 0 and self.safe_pickup_route(start, point):
                 options.append(option)
@@ -781,7 +785,7 @@ class Selective(eb.Bot):
                 threats = tuple(self.wedge_threats(point))
                 exposed_score = score - sum(weight for _, weight in threats) if threats else score + FFA_HIDDEN_REWARD
                 candidates.append((exposed_score, score, run, point, base, threats))
-            # Give the best candidates under open sightlines first use of the ray budget.
+            
             candidates.sort(reverse=True, key=lambda option: option[:4])
         else:
             standing = [option for option in options if option[1] == 0]
@@ -918,7 +922,7 @@ class Selective(eb.Bot):
             candidates.sort(reverse=True)
             best, _, move = candidates[0]
             if arena is not None and origin is not None:
-                # Check hard cover only for the best nearby, reachable escape directions.
+                
                 for (inside, away, score), end, direction in candidates[:4]:
                     if not arena.clear_ray(origin, raised(end + (pos[2],), height * 0.65)):
                         option = (inside, away, score + 15)
@@ -950,7 +954,7 @@ class Selective(eb.Bot):
                 self.sprinting = escape["boost"]
                 return escape
             if self.single_escape:
-                # Let the ordinary obstacle steering find a short way around a blocked escape leg.
+                
                 waypoint = zone.center if distance(pos, waypoint) < eb.HOLD_M else waypoint
                 evade = True
         nearest = self.rivals[0][0] if self.rivals else math.inf
@@ -993,7 +997,7 @@ class Selective(eb.Bot):
         return move
 
     def sweep_cube(self, pos, zone, stats, move):
-        # Cubes are automatic. A small correction can bring a passing cube into pickup range.
+        
         if self.nearby_cube is None or self.climb:
             return
         dx, dy = move["move"]
@@ -1007,7 +1011,7 @@ class Selective(eb.Bot):
         reach = limit(number(self.cubes.get("pickup_radius"), 3.5), 0.5, FFA_PICKUP_NEAR_M)
         if forward <= 0 or abs(side) <= reach:
             return
-        # Turn only far enough to graze the pickup circle, preserving movement speed.
+        
         turn = math.copysign(math.atan2(abs(side), forward) - math.asin(min(1, (reach - 0.1) / math.hypot(x, y))), side)
         if abs(turn) > 0.35:
             return
@@ -1201,7 +1205,7 @@ class Selective(eb.Bot):
         return True
 
     def finish_damage(self, enemy, pos):
-        """Estimate landed damage in 1.5 s with our current magazines, cooldowns and aim."""
+        
         total = 0.0
         muzzle = self.phys("muzzle_height", 7, self.self_stats)
         pitch = self.phys("min_pitch", -0.7, self.self_stats), self.phys("max_pitch", 1.3, self.self_stats)
@@ -1276,7 +1280,7 @@ class Selective(eb.Bot):
         return [(50, self.farm)] if self.farm is not None and not self.farm_blocked else []
 
     def aim_for(self, weapon, target, base, muzzle, pitch_bounds):
-        # A charging laser fires on release, so farm with a weapon we can stop immediately.
+        
         if target.kind != "mech" and weapon.get("kind") != "gun":
             return None
         return super().aim_for(weapon, target, base, muzzle, pitch_bounds)
@@ -1321,8 +1325,8 @@ class Selective(eb.Bot):
         return yaw
 
     def release_laser_safely(self, obs, action, pos):
-        # A false trigger releases an existing charge. Hold only until the beam
-        # clears any visible unauthorized target, then release and regain speed.
+        
+        
         for index, weapon in enumerate(self.weapon_slots):
             if weapon.get("kind") != "laser" or number(weapon.get("charge")) <= 0 or action["fire"][index]:
                 continue
@@ -1386,7 +1390,7 @@ class Selective(eb.Bot):
                          and distance_sq(pos, point) <= FFA_PICKUP_NEAR_M ** 2),
                         key=lambda point: distance_sq(pos, point), default=None)
                 self.observe(me, pos, self.actual, now)
-                # Seed the inherited contact ranking with hits seen before the switch.
+                
                 self.hits.update({ident: when for ident, (when, _) in self.attackers.items()
                                   if 0 <= now - when < eb.HIT_MEMORY_S})
             self.last_fire_target = None
@@ -1438,9 +1442,208 @@ class Selective(eb.Bot):
         return action
 
 
+class PracticeRelay:
+    ACTION_FIELDS = {"type", "tick", "move", "aim", "fire", "boost", "jump", "reload",
+                     "pick", "take", "drop", "debug"}
+
+    def __init__(self):
+        self.child = None
+        self.reaper = None
+        self.kill_timer = None
+        self.connected = False
+        self.pending = deque()
+        self.partial = b""
+        self.discarding = False
+        self.fallbacks = 0
+        self.consecutive_fallbacks = 0
+
+    def start(self, hello):
+        deadline = time.perf_counter() + 8
+        try:
+            self.child = subprocess.Popen(
+                ["./mechbot"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL, bufsize=0, env={**os.environ, "MECHBOT_SALT": str(P4_SALT)},
+            )
+            self.reaper = threading.Thread(target=self.child.wait)
+            self.reaper.start()
+            os.set_blocking(self.child.stdin.fileno(), False)
+            os.set_blocking(self.child.stdout.fileno(), False)
+            self.connected = True
+        except OSError as error:
+            mf.log(f"Child could not start ({type(error).__name__})")
+            self.stop()
+            return
+        self.pending.append(memoryview(hello))
+        if self.exchange(deadline, None, 4096) is None:
+            mf.log('m1')
+            self.stop()
+
+    @classmethod
+    def matches(cls, line, tick):
+        try:
+            msg = json.loads(line.decode("utf-8"))
+        except (ValueError, RecursionError):
+            return False
+        if not isinstance(msg, dict):
+            return False
+        if tick is None:
+            return msg.get("type") == "ready"
+        if (msg.get("type", "action") != "action" or type(msg.get("tick")) not in (int, float)
+                or msg["tick"] != tick or not msg.keys() <= cls.ACTION_FIELDS):
+            return False
+        if any(name in msg and mf._pair(msg[name]) is None for name in ("move", "aim")):
+            return False
+        if "fire" in msg:
+            fire = msg["fire"]
+            if not isinstance(fire, list) or len(fire) != 2 or any(type(flag) is not bool for flag in fire):
+                return False
+        return (all(name not in msg or type(msg[name]) is bool for name in ("boost", "jump", "reload"))
+                and all(name not in msg or type(msg[name]) in (int, float) and -1e15 <= msg[name] <= 1e15
+                        for name in ("pick", "take", "drop"))
+                and ("debug" not in msg or isinstance(msg["debug"], dict)))
+
+    def read_lines(self, fd, limit):
+        data = os.read(fd, 8192)
+        if not data:
+            self.connected = False
+            return ()
+        lines = (self.partial + data).split(b"\n")
+        self.partial = lines.pop()
+        if self.discarding and lines:
+            del lines[0]
+            self.discarding = False
+        if self.discarding or len(self.partial) >= limit:
+            self.partial = b""
+            self.discarding = True
+        return lines
+
+    def exchange(self, deadline, tick, limit, refresh=None):
+        if not self.connected:
+            return None
+        send_fd, recv_fd = self.child.stdin.fileno(), self.child.stdout.fileno()
+        if self.partial:
+            self.partial = b""
+            self.discarding = True
+        input_fd = None
+        candidate = None
+        try:
+            while self.connected:
+                if refresh is not None:
+                    tick, deadline, input_fd = refresh()
+                    if not self.connected:
+                        break
+                
+                if candidate is not None:
+                    if not self.pending and time.perf_counter() <= deadline:
+                        return candidate
+                    candidate = None
+                remaining = max(0, deadline - time.perf_counter())
+                sent = not self.pending
+                readers = [recv_fd] if input_fd is None else [recv_fd, input_fd]
+                readable, writable, _ = select.select(readers, [] if sent else [send_fd], [], remaining)
+                if input_fd in readable:
+                    continue
+                if not readable and not writable:
+                    if input_fd is not None and select.select([input_fd], [], [], 0)[0]:
+                        continue
+                    break
+                if readable:
+                    lines = self.read_lines(recv_fd, limit)
+                    if sent:
+                        for line in lines:
+                            if (len(line) < limit and self.matches(line, tick)
+                                    and time.perf_counter() <= deadline):
+                                candidate = line + b"\n"
+                                break
+                    elif self.partial:
+                        self.partial = b""
+                        self.discarding = True
+                if writable and self.connected:
+                    frame = self.pending[0]
+                    written = os.write(send_fd, frame)
+                    if written == len(frame):
+                        self.pending.popleft()
+                    else:
+                        self.pending[0] = frame[written:]
+                if remaining == 0 and candidate is None:
+                    if input_fd is not None and select.select([input_fd], [], [], 0)[0]:
+                        continue
+                    break
+        except BlockingIOError:
+            return None
+        except OSError:
+            self.connected = False
+        return None
+
+    def stop(self):
+        child, self.child = self.child, None
+        self.connected = False
+        self.pending.clear()
+        self.partial = b""
+        if child is not None:
+            child.terminate()
+            child.stdin.close()
+            child.stdout.close()
+            if child.returncode is None:
+                self.kill_timer = threading.Timer(0.1, child.kill)
+                self.kill_timer.daemon = True
+                self.kill_timer.start()
+
+    def close(self):
+        self.stop()
+        if self.reaper is not None:
+            self.reaper.join()
+        if self.kill_timer is not None:
+            self.kill_timer.cancel()
+
+    def decide(self, bot, obs, raw, tick, received, frame_limit, pause_show, queued=None):
+        def track(frame):
+            try:
+                now = bot.track_tick(obs)
+            except Exception:
+                return None
+            if bot.mode == "free-for-all":
+                self.stop()
+            elif self.connected:
+                self.pending.append(memoryview(frame))
+            return now
+
+        def refresh():
+            nonlocal obs, tick, received, now
+            if queued is not None:
+                for next_obs, frame, next_tick, timestamp in queued.drain():
+                    if self.connected and now is not None:
+                        bot.practice.remember(obs, now)
+                    obs, tick, received = next_obs, next_tick, timestamp
+                    now = track(frame)
+            return tick, received + P4_DEADLINE_MS / 1000, queued.fd if queued is not None else None
+
+        now = track(raw)
+        tick, child_deadline, _ = refresh()
+        if now is not None and self.child is not None:
+            payload = self.exchange(child_deadline, tick, frame_limit, refresh)
+            if payload is not None:
+                self.consecutive_fallbacks = 0
+                bot.practice.remember(obs, now)
+                return payload, received + P4_DEADLINE_MS / 1000 + mf.WRITE_RESERVE_S
+            if self.child is not None:
+                self.fallbacks += 1
+                self.consecutive_fallbacks += 1
+                if self.consecutive_fallbacks == 20:
+                    self.stop()
+        deadline = received + mf.DECISION_LIMIT_S
+        if now is None:
+            return None, deadline
+        if bot.mode != "free-for-all":
+            deadline = time.perf_counter() + mf.DECISION_LIMIT_S
+        remaining = deadline - mf.WRITE_RESERVE_S - time.perf_counter()
+        payload = (mf._watched(remaining, mf._decision, bot, obs, tick, pause_show, now)
+                   if remaining > 0 else None)
+        return payload, deadline
+
+
 class Royale:
     def __init__(self, hello):
-        # Both legacy practice and Selective's fallback keep the v6c draw.
         duel_bot.SEED_SALT = 6
         self.practice = duel_bot.DuelBot(hello)
         self.practice.guarded = GUARDED_OPENER
@@ -1451,14 +1654,14 @@ class Royale:
         self.practice2 = None
         self.practice3 = None
         self.practice_fallbacks = 0
-        if P_DRIVER in (2, 3) and self.mode == "practice":
+        if P_DRIVER in (2, 3, 4) and self.mode == "practice":
             try:
                 if P_DRIVER == 2:
                     from practice2 import Practice
                 else:
                     from practice3 import Practice
             except ImportError:
-                mf.log(f"driver {P_DRIVER} unavailable, using legacy")
+                mf.log(f"driver {min(P_DRIVER, 3)} unavailable")
             else:
                 driver = Practice(hello, SEED)
                 if P_DRIVER == 2:
@@ -1467,7 +1670,6 @@ class Royale:
                     self.practice3 = driver
 
     def __getattr__(self, name):
-        # Tools and tests that inspect the policy see the active one.
         if name in ("practice", "practice2", "practice3", "ffa", "detector", "mode", "first_ffa"):
             raise AttributeError(name)
         if self.mode == "free-for-all":
@@ -1498,8 +1700,7 @@ class Royale:
         except Exception as error:
             mf.log(f"practice3 map: {type(error).__name__}")
 
-    def act(self, obs):
-        obs = obj(obs)
+    def track_tick(self, obs):
         now = number(obs.get("t"), 0)
         if FORCE_MODE is None:
             try:
@@ -1510,10 +1711,17 @@ class Royale:
                 self.mode = want
                 if want == "free-for-all" and self.first_ffa is None:
                     self.first_ffa = round(now, 1)
-                mf.log(f"mode {want}: {self.detector.reason}")
+                mf.log(f"mode {want}")
+        if self.mode != "free-for-all":
+            self.ffa.record(obs, vec(obj(obs.get("self")).get("pos"), 3), now)
+        return now
+
+    def act(self, obs, now=None):
+        obs = obj(obs)
+        if now is None:
+            now = self.track_tick(obs)
         if self.mode == "free-for-all":
             return self.ffa.act(obs)
-        self.ffa.record(obs, vec(obj(obs.get("self")).get("pos"), 3), now)
         driver = self.practice2 or self.practice3
         if driver is not None:
             try:
@@ -1532,5 +1740,16 @@ class Royale:
         return self.practice.act(obs)
 
 
+def main():
+    if P_DRIVER == 4 and FORCE_MODE != "free-for-all":
+        relay = PracticeRelay()
+        try:
+            mf.run(Royale, pause_show=PAUSE_SHOW, raw_wire=relay)
+        finally:
+            relay.close()
+    else:
+        mf.run(Royale, pause_show=PAUSE_SHOW, practice_wire=P_DRIVER == 2 and FORCE_MODE != "free-for-all")
+
+
 if __name__ == "__main__":
-    mf.run(Royale, pause_show=PAUSE_SHOW, practice_wire=P_DRIVER == 2 and FORCE_MODE != "free-for-all")
+    main()

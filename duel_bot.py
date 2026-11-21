@@ -1,8 +1,4 @@
-"""Duel-first policy for Mech Royale practice: fight the squad one hunter at a time.
 
-The map, routing, zone, loot and aiming helpers come from example_bot.py (the survive-first
-policy, kept as the free-for-all mode). This file decides when and how to fight.
-"""
 import math
 import random
 import time
@@ -11,10 +7,10 @@ import mechfight as mf
 import example_bot as eb
 from example_bot import (Bot, Contact, Zone, ZERO, obj, seq, number, vec, limit, angle, bearing, distance)
 
-SHELTER_SLICE_S = 0.006     # time caps are safety nets only: node and count limits should bind
+SHELTER_SLICE_S = 0.006
 STEER_SLICE_S = 0.004
-SEED_SALT = 0               # set by royale.SEED; changes every random choice, same policy
-PLAY_MODE = "practice"  # "practice" = duel-first (this file); "free-for-all" = survive-first example_bot.Bot
+SEED_SALT = 0
+PLAY_MODE = "practice"  
 
 DUEL_UPGRADES = {
     "plating": 100, "gun_mag": 97, "armor": 96, "gun_damage": 92, "lightning_efficiency": 89,
@@ -24,25 +20,25 @@ DUEL_UPGRADES = {
     "mortar_splash": 26, "laser_pierce": 20,
 }
 KNOWN_WEAPONS = ("gun", "mortar", "laser", "lightning")
-SECOND_RANK = {"laser": 3, "lightning": 2}   # laser first; never pick up a mortar (laser cook-off)
+SECOND_RANK = {"laser": 3, "lightning": 2}   
 
 
 class _Ranks(dict):
-    """Weapon ranks for the shared loot code: .get() hides the mortar so it is never taken."""
+    
     def get(self, key, default=None):
         return None if key == "mortar" else super().get(key, default)
 
 
 DUEL_WEAPON_RANK = _Ranks({"gun": 0, "mortar": -1, "lightning": 2, "laser": 3})
-FIRST_WEAPON_DETOUR_M = 160.0   # walk this far for a first laser or lightning
-LASER_DETOUR_M = 90.0           # and this far to add a laser
+FIRST_WEAPON_DETOUR_M = 160.0   
+LASER_DETOUR_M = 90.0           
 LASER_RANGE_M = 110.0
-REPAIR_TO = 0.85                # heal to this share before hunting the next one
-VEL_SMOOTH = 0.35          # weight of the newest velocity sample in the per-target average
-RETREAT_FRACTION = 0.30    # break contact below this health share when the duel is going badly
+REPAIR_TO = 0.85                
+VEL_SMOOTH = 0.35          
+RETREAT_FRACTION = 0.30    
 NPC_FARM_M = 120.0
 FIGHT_CUBE_M = 40.0
-GUN_RANGE_M = 90.0          # preferred gun-only duel range (simulator: dodging needs flight time)
+GUN_RANGE_M = 90.0
 STRAFE_MIN_S = 0.3
 STRAFE_MAX_S = 0.7
 CRATE_FARM_M = 70.0
@@ -60,12 +56,12 @@ class DuelBot(Bot):
         self.mode = "start"
         self.hp_share = 1.0
         self.dodging = False
-        self.guarded = False   # opener: fight only mechs that attack or close on us
-        self.last_seen = {}        # mech id -> (time, pos)
-        self.kill_spot = None      # (time, pos) where a victim died
-        self.hunt_point = None     # (time, pos) best guess of where a hunter is
+        self.guarded = False   
+        self.last_seen = {}        
+        self.kill_spot = None      
+        self.hunt_point = None     
 
-    # ------------------------------------------------------------------ targets
+    
     def track(self, contacts):
         for c in contacts:
             old = self.vel_avg.get(c.id)
@@ -75,7 +71,7 @@ class DuelBot(Bot):
             self.vel_avg[c.id] = v
 
     def lead_contact(self, c):
-        """Aim between the current velocity and the recent mean: a jinking target averages out."""
+        
         avg = self.vel_avg.get(c.id, c.vel)
         vel = tuple(0.5 * a + 0.5 * b for a, b in zip(avg, c.vel))
         return Contact(c.id, c.kind, c.pos, vel, c.aim, c.hp, c.max_hp, c.scale, c.dist, c.face_error,
@@ -115,7 +111,7 @@ class DuelBot(Bot):
         return sorted(targets, key=lambda choice: choice[0], reverse=True)[:4]
 
     def engaging_us(self, c, pos):
-        """A mech that has hit us, is close, or is closing on us while facing us."""
+        
         if c.attacker or c.dist < 60:
             return True
         dx, dy = pos[0] - c.pos[0], pos[1] - c.pos[1]
@@ -124,7 +120,7 @@ class DuelBot(Bot):
         facing = c.aim is not None and abs(angle(c.aim[0] - bearing(c.pos, pos))) < 0.5
         return c.dist < 140 and closing > 3.0 and facing
 
-    # ----------------------------------------------------------------- movement
+    
     def desired_range(self, kinds, foe):
         theirs = {k for k in foe.armed if k in KNOWN_WEAPONS}
         if "lightning" in kinds:
@@ -136,9 +132,9 @@ class DuelBot(Bot):
         else:
             r = GUN_RANGE_M
         if "lightning" in theirs and "lightning" not in kinds:
-            r = max(r, 55.0)          # stay out of their arc
+            r = max(r, 55.0)          
         if "mortar" in theirs and "lightning" in kinds:
-            r = min(r, 22.0)          # inside the shell's useful range
+            r = min(r, 22.0)          
         if "laser" in theirs and "lightning" not in kinds:
             r = min(r, 30.0)
         return r
@@ -161,21 +157,21 @@ class DuelBot(Bot):
             self.strafe_sign = -self.strafe_sign if self.rng.random() < 0.8 else self.strafe_sign
             self.strafe_until = now + self.rng.uniform(STRAFE_MIN_S, STRAFE_MAX_S)
         to_me = bearing(foe.pos, pos)
-        radial = limit((d - want) / 12.0, -1.0, 1.0)           # >0: too far, close in
+        radial = limit((d - want) / 12.0, -1.0, 1.0)           
         if foe.charging and foe.aim is not None and d > 25 and abs(angle(foe.aim[0] - bearing(foe.pos, pos))) < 0.2:
-            # A laser is charging on us: step sideways at full speed, no radial drift.
+            
             if not self.dodging:
                 self.dodging = True
                 self.strafe_until = now + self.rng.uniform(0.5, 0.9)
             radial = 0.0
         else:
             self.dodging = False
-        # Move tangentially around the foe, plus a radial correction toward the wanted range.
+        
         tangent = to_me + self.strafe_sign * math.pi / 2
         mx = math.cos(tangent) * (1 - abs(radial) * 0.6) - math.cos(to_me) * radial
         my = math.sin(tangent) * (1 - abs(radial) * 0.6) - math.sin(to_me) * radial
         course = math.atan2(my, mx)
-        # Do not strafe out of the zone.
+        
         ahead = (pos[0] + 12 * math.cos(course), pos[1] + 12 * math.sin(course))
         if zone.gap(ahead, 3) < 2:
             self.strafe_sign = -self.strafe_sign
@@ -188,14 +184,14 @@ class DuelBot(Bot):
                  or self.dodging and energy > 15)
         return [math.cos(free), math.sin(free)], boost
 
-    # ---------------------------------------------------------------------- act
+    
     def act(self, obs):
         if PLAY_MODE != "practice":
             return super().act(obs)
         try:
             return self.duel_act(obs)
         except (ArithmeticError, LookupError, TypeError, ValueError, AttributeError) as error:
-            mf.log(f"duel policy error, using the survive-first policy this tick: {error!r}")
+            mf.log(f"Policy error: {type(error).__name__}")
             return super().act(obs)
 
     def duel_act(self, obs):
@@ -282,11 +278,11 @@ class DuelBot(Bot):
             foe = min(hunters, key=foe_key)
         foe_share = (foe.hp / foe.max_hp) if foe is not None and math.isfinite(foe.hp) else 1.0
 
-        # Retreat to repair when losing badly and the foe is not nearly dead.
+        
         if foe is not None and fraction < RETREAT_FRACTION and foe_share > fraction + 0.15 and len(visible) >= 1:
             self.retreat_until = now + 4.0
         if foe is not None and foe_share < 0.25 and fraction > 0.12:
-            self.retreat_until = -math.inf   # finish it
+            self.retreat_until = -math.inf   
         retreating = now < self.retreat_until or (len(visible) >= 3 and fraction < 0.6)
 
         move = None
@@ -299,13 +295,13 @@ class DuelBot(Bot):
             move, boost = self.engage_move(pos, foe, kinds, zone, now, radius, height, energy, fraction, hunters)
             cube = self.cube_goal(obs, pos, zone, FIGHT_CUBE_M) if fraction > RETREAT_FRACTION else None
             if cube is not None:
-                # Kill cubes heal and add damage: walk onto them mid-fight, still aiming at the foe.
+                
                 self.mode = "duel-cube"
                 c = bearing(pos, cube)
                 move = [math.cos(c), math.sin(c)]
                 boost = energy > 30
             if not foe.clear and foe.dist > 30:
-                # Close in along a route rather than strafing into a wall.
+                
                 waypoint = self.route(pos, foe.pos[:2], zone, radius, height, now < self.stuck_until,
                                       min(until, time.perf_counter() + eb.ROUTE_SLICE_S))
                 c = bearing(pos, waypoint)
@@ -327,7 +323,7 @@ class DuelBot(Bot):
             boost = energy > 20
         elif not urgent and not terminal_burn:
             saved = eb.WEAPON_RANK, eb.WEAPON_DETOUR_M
-            eb.WEAPON_RANK = DUEL_WEAPON_RANK   # one ranking for walking to loot and swapping at our feet
+            eb.WEAPON_RANK = DUEL_WEAPON_RANK   
             if not ({"laser", "lightning"} & kinds):
                 eb.WEAPON_DETOUR_M = FIRST_WEAPON_DETOUR_M
             elif "laser" not in kinds:
@@ -372,7 +368,7 @@ class DuelBot(Bot):
             if boost and energy > 20:
                 action["boost"] = True
             if (urgent or terminal_burn) and visible and not hazards and zone.radius > eb.DEATH_CIRCLE_M:
-                # Moving to the zone under fire: weave a little so the lead misses.
+                
                 m = action.get("move") or [0.0, 0.0]
                 if math.hypot(*m) > 0.5:
                     if now >= self.strafe_until:
@@ -390,7 +386,7 @@ class DuelBot(Bot):
                 action["move"] = move
                 action["boost"] = bool(boost)
 
-        # Aim: at the foe, else the last damage, else where we go.
+        
         if foe is not None:
             direction = bearing(pos, foe.pos)
         elif just_hit and self.damage_bearing is not None:
@@ -400,7 +396,7 @@ class DuelBot(Bot):
         else:
             m = action.get("move") or [0.0, 0.0]
             direction = math.atan2(m[1], m[0]) if math.hypot(*m) > 0.2 else angle(self.scout_yaw + now * eb.SCAN_RATE)
-            # Sweep a little either side of the walking line so hunters behind are seen sooner.
+            
             direction = angle(direction + 0.9 * math.sin(now * 1.3))
         action["aim"] = [direction, 0.0]
         if time.perf_counter() < until + 0.002:
@@ -462,11 +458,11 @@ class DuelBot(Bot):
             if d < 150 and d < best:
                 best, goal = d, p[:2]
         if goal is not None and distance(pos, goal) < 25:
-            return None  # close enough to shoot it from here
+            return None  
         return goal
 
     def keep_lightning(self, obs, weapons, action):
-        """Taking a laser while holding gun + lightning: drop the gun, keep the arc."""
+        
         take = action.get("take")
         if take is None or "drop" not in action:
             return
@@ -480,7 +476,7 @@ class DuelBot(Bot):
             action["drop"] = kinds.index("gun")
 
     def better_weapon(self, obs, pos, weapons, action):
-        """Swap the gun or a weak second weapon for a better one lying within reach."""
+        
         if "take" in action:
             return
         held = [w.get("kind") for w in weapons]
