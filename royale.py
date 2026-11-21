@@ -19,15 +19,18 @@ from example_bot import obj, seq, number, vec, distance, bearing, angle, limit, 
 SEED = 1                    # the only source of randomness; a different value is a different draw
 FORCE_MODE = None           # None = detect; "practice" or "free-for-all" pins the policy
 GUARDED_OPENER = True       # squad play fights only mechs that attack or close on us
+PAUSE_MED_MS = 8.0
+PAUSE_MIN_MS = 4.0
+PAUSE_SHOW = True
 
 
 class Detector:
     """Strict free-for-all detector: it must stay quiet in the squad game.
 
     House bots never fight each other, so before the zone turns deadly a mech we did not kill
-    almost never dies, and no laser beam goes from one mech into another. Only those two
-    signals count here (HP loss can come from drones we cannot see; lightning arcs pick
-    drones and crates too). Free-for-all once:
+    almost never dies, and no laser beam goes from one mech into another. Unseen drones can
+    cause HP loss, and lightning can arc to drones and crates too. Free-for-all once:
+      - median and minimum pauses between decisions both exceed their thresholds, or
       - 2 deaths we did not cause while zone dps <= 35 (the first two phases), or
       - 3 such deaths while zone dps <= 100, or
       - laser beams from one mech ending on another, away from us and from drones and
@@ -45,6 +48,10 @@ class Detector:
 
     def update(self, obs, now):
         if self.ffa:
+            return True
+        g_med, g_min = mf.pause_ms
+        if g_med is not None and g_med > PAUSE_MED_MS and g_min > PAUSE_MIN_MS:
+            self.ffa, self.reason = True, f"pause {g_med:.1f}/{g_min:.1f} ms"
             return True
         for event in seq(obs.get("events"))[:200]:
             if obj(event).get("type") == "kill":
@@ -494,4 +501,4 @@ class Royale:
 
 
 if __name__ == "__main__":
-    mf.run(Royale)
+    mf.run(Royale, pause_show=PAUSE_SHOW)

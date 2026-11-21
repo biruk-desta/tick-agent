@@ -27,6 +27,7 @@ import math
 import os
 import select
 import signal
+import statistics
 import sys
 import time
 from typing import Any, Dict, List, Literal, Optional, TypedDict, Union
@@ -42,6 +43,7 @@ INPUT_FRAME_LIMIT = 8
 DECISION_LIMIT_S = 0.014
 WRITE_RESERVE_S = 0.002
 INIT_LIMIT_S = 6.0
+pause_ms = (None, None)  # Median and minimum of the first ten eligible gaps.
 
 # --- generated from mechfight.schema.json: do not edit ---
 # Every message a bot sends the server.
@@ -505,8 +507,7 @@ def _send(fd, payload, deadline):
     # or leaves stdout untouched. A slow reader cannot hold up later decisions.
     while True:
         try:
-            os.write(fd, payload)
-            return
+            return time.perf_counter() if os.write(fd, payload) == len(payload) else None
         except BlockingIOError:
             remaining = deadline - time.perf_counter()
             if remaining <= 0 or not select.select([], [fd], [], remaining)[1]:
@@ -545,15 +546,27 @@ def _lines(fd):
         yield None, received if select.select([fd], [], [], 0)[0] else None
 
 
-def _decision(bot, obs, tick):
+def _encode_action(action, obs, pause_show):
+    g_med, g_min = pause_ms
+    now = obs.get("t")
+    if pause_show and g_med is not None and type(now) in (int, float) and 1.3 <= now < 3.7:
+        gap = g_med if now < 2.5 else g_min
+        action["aim"] = [math.radians(-170 + 5 * min(gap, 68)), 0.0]
+        action["fire"] = [False, False]
+    return _encode(action)
+
+
+def _decision(bot, obs, tick, pause_show):
     action = bot.act(obs)
     if isinstance(action, dict) and action:
-        return _encode({**action, "tick": tick})
+        return _encode_action({**action, "tick": tick}, obs, pause_show)
     return None
 
 
-def run(make_bot: Any) -> None:
+def run(make_bot: Any, *, pause_show: bool = False) -> None:
     """Run a bot until end or EOF, with a watchdog around each decision."""
+    global pause_ms
+    pause_ms = (None, None)
     # Each process runs a single match. The JSON and policy state are acyclic.
     gc.disable()
     signal.signal(signal.SIGALRM, _interrupt)
@@ -562,7 +575,11 @@ def run(make_bot: Any) -> None:
     frame_limit = os.fpathconf(stdout, "PC_PIPE_BUF")
     bot = None
     handshaken = False
+    decide_every = 2
     last_tick = -2
+    last_sent = None
+    observations = 0
+    gaps = []
     latest = None
     batch_start = None
     frames = 0
@@ -576,6 +593,11 @@ def run(make_bot: Any) -> None:
                 kind = msg.get("type")
                 if kind == "hello" and not handshaken:
                     handshaken = True
+                    config = msg.get("config")
+                    match = config.get("match") if isinstance(config, dict) else None
+                    stride = match.get("decide_every") if isinstance(match, dict) else None
+                    if type(stride) in (int, float) and 1 <= stride <= 1e15 and stride == int(stride):
+                        decide_every = stride
                     bot = _watched(INIT_LIMIT_S, make_bot, msg)
                     if bot is None:
                         log("Bot initialization failed. Using map-free steering.")
@@ -584,8 +606,10 @@ def run(make_bot: Any) -> None:
                         log("Arena unavailable. Using the full policy without map routing.")
                     _send(stdout, b'{"type":"ready"}\n', time.perf_counter() + DECISION_LIMIT_S)
                 elif kind == "obs":
-                    if latest is None:
+                    queued = latest is not None
+                    if not queued:
                         batch_start = received
+                    observations += 1
                     latest = msg
                 elif kind == "end":
                     return
@@ -601,14 +625,29 @@ def run(make_bot: Any) -> None:
         frames = 0
         deadline = batch_start + DECISION_LIMIT_S
         tick = obs.get("tick")
-        if type(tick) not in (int, float) or not -1e15 <= tick <= 1e15 or not math.isfinite(tick):
+        valid_tick = type(tick) in (int, float) and -1e15 <= tick <= 1e15
+        if not valid_tick:
             tick = last_tick + 2
+        if gaps is not None:
+            now = obs.get("t")
+            if type(now) in (int, float):
+                if (0 <= now <= 3.0 and observations > 2 and not queued and valid_tick
+                        and tick == last_tick + decide_every and last_sent is not None
+                        and batch_start >= last_sent):
+                    gaps.append((batch_start - last_sent) * 1000)
+                if len(gaps) == 10:
+                    pause_ms = (statistics.median(gaps), min(gaps))
+                    gaps = None
+                elif now >= 3.0:
+                    gaps = None
         last_tick = tick
         remaining = deadline - WRITE_RESERVE_S - time.perf_counter()
-        payload = _watched(remaining, _decision, bot, obs, tick) if bot is not None and remaining > 0 else None
+        payload = (_watched(remaining, _decision, bot, obs, tick, pause_show)
+                   if bot is not None and remaining > 0 else None)
         if payload is None or len(payload) > frame_limit:
-            payload = _encode(_fallback(obs, tick))
-        _send(stdout, payload, deadline)
+            payload = _encode_action(_fallback(obs, tick), obs, pause_show)
+        sent = _send(stdout, payload, deadline)
+        last_sent = sent if valid_tick else None
 
 
 if __name__ == "__main__":
