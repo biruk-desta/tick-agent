@@ -40,7 +40,7 @@ LASER_DETOUR_M = 90.0           # and this far to add a laser
 # The unguarded DuelBot used by Selective's error fallback retains its old policy.
 PRACTICE_FOCUS_COMMIT = False
 PRACTICE_RANGE_DISCIPLINE = False
-PRACTICE_FIRE_CYCLE = False
+PRACTICE_FIRE_CYCLE = True
 PRACTICE_PLAN_S = 0.008
 FOCUS_SWITCH_MARGIN = 32.0
 FOCUS_BLOCKED_S = 0.6
