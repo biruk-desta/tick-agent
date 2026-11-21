@@ -11,6 +11,9 @@ import mechfight as mf
 import example_bot as eb
 from example_bot import (Bot, Contact, Zone, ZERO, obj, seq, number, vec, limit, angle, bearing, distance)
 
+SHELTER_SLICE_S = 0.006     # time caps are safety nets only: node and count limits should bind
+STEER_SLICE_S = 0.004
+SEED_SALT = 0               # set by royale.SEED; changes every random choice, same policy
 PLAY_MODE = "practice"  # "practice" = duel-first (this file); "free-for-all" = survive-first example_bot.Bot
 
 DUEL_UPGRADES = {
@@ -49,7 +52,7 @@ CRATE_FARM_M = 70.0
 class DuelBot(Bot):
     def __init__(self, hello):
         super().__init__(hello)
-        self.rng = random.Random(number(hello.get("seed"), 0))
+        self.rng = random.Random(int(SEED_SALT) * 1000003 + int(number(hello.get("seed"), 0)))
         self.strafe_sign = 1 if self.rng.random() < 0.5 else -1
         self.strafe_until = 0.0
         self.vel_avg = {}
@@ -314,7 +317,7 @@ class DuelBot(Bot):
             cover = None
             if time.perf_counter() < until:
                 cover = self.shelter_point(pos, zone, contacts, direction, radius, height, now,
-                                           min(until, begin + 0.0029), False)
+                                           min(until, begin + SHELTER_SLICE_S), False)
             if cover is not None:
                 goal = cover
             else:
@@ -369,7 +372,7 @@ class DuelBot(Bot):
             evade = bool(hazards) or just_hit or bool(visible)
             mv = self.movement(pos, velocity, waypoint, zone, urgent, evade, hunters, hazards,
                                self.damage_bearing if just_hit else None, stats, grounded, energy, now,
-                               min(until, time.perf_counter() + 0.0020), in_zone, terminal_burn, None)
+                               min(until, time.perf_counter() + STEER_SLICE_S), in_zone, terminal_burn, None)
             action.update(mv)
             if boost and energy > 20:
                 action["boost"] = True
@@ -386,7 +389,7 @@ class DuelBot(Bot):
             if hazards:
                 mv = self.movement(pos, velocity, (pos[0] + move[0] * 10, pos[1] + move[1] * 10), zone, False, True,
                                    hunters, hazards, None, stats, grounded, energy, now,
-                                   min(until, time.perf_counter() + 0.0020), in_zone, False, None)
+                                   min(until, time.perf_counter() + STEER_SLICE_S), in_zone, False, None)
                 action.update(mv)
             else:
                 action["move"] = move
