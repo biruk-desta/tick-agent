@@ -36,7 +36,7 @@ class _Ranks(dict):
 DUEL_WEAPON_RANK = _Ranks({"gun": 0, "mortar": -1, "lightning": 2, "laser": 3})
 FIRST_WEAPON_DETOUR_M = 160.0   # walk this far for a first laser or lightning
 LASER_DETOUR_M = 90.0           # and this far to add a laser
-LASER_RANGE_M = 130.0
+LASER_RANGE_M = 110.0
 REPAIR_TO = 0.85                # heal to this share before hunting the next one
 VEL_SMOOTH = 0.35          # weight of the newest velocity sample in the per-target average
 RETREAT_FRACTION = 0.30    # break contact below this health share when the duel is going badly
