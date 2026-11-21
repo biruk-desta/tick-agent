@@ -9,6 +9,7 @@ import math
 
 import mechfight as mf
 import example_bot as eb
+import duel_bot
 from example_bot import obj, seq, number, vec, distance
 
 FORCE_MODE = None          # None = detect; "practice" or "free-for-all" pins the policy
@@ -71,7 +72,7 @@ class Detector:
 
 class Royale:
     def __init__(self, hello):
-        self.practice = eb.PracticeBot(hello)
+        self.practice = duel_bot.DuelBot(hello)
         self.ffa = eb.Bot(hello)
         self.detector = Detector(hello)
         self.mode = FORCE_MODE or "practice"
