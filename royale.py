@@ -1451,12 +1451,20 @@ class Royale:
         self.practice2 = None
         self.practice3 = None
         self.practice_fallbacks = 0
-        if P_DRIVER == 2 and self.mode == "practice":
-            from practice2 import Practice
-            self.practice2 = Practice(hello, SEED)
-        if P_DRIVER == 3 and self.mode == "practice":
-            from practice3 import Practice
-            self.practice3 = Practice(hello, SEED)
+        if P_DRIVER in (2, 3) and self.mode == "practice":
+            try:
+                if P_DRIVER == 2:
+                    from practice2 import Practice
+                else:
+                    from practice3 import Practice
+            except ImportError:
+                mf.log(f"driver {P_DRIVER} unavailable, using legacy")
+            else:
+                driver = Practice(hello, SEED)
+                if P_DRIVER == 2:
+                    self.practice2 = driver
+                else:
+                    self.practice3 = driver
 
     def __getattr__(self, name):
         # Tools and tests that inspect the policy see the active one.
