@@ -14,14 +14,27 @@ from example_bot import (Bot, Contact, Zone, ZERO, obj, seq, number, vec, limit,
 PLAY_MODE = "practice"  # "practice" = duel-first (this file); "free-for-all" = survive-first example_bot.Bot
 
 DUEL_UPGRADES = {
-    "plating": 100, "armor": 96, "gun_damage": 92, "gun_rate": 90, "lightning_efficiency": 89,
-    "laser_damage": 88, "nanites": 84, "laser_charge": 82, "gun_mag": 80, "reactor": 72,
+    "plating": 100, "gun_mag": 97, "armor": 96, "gun_damage": 92, "lightning_efficiency": 89,
+    "laser_damage": 88, "gun_rate": 86, "nanites": 84, "laser_charge": 82, "reactor": 72,
     "capacitor": 70, "gyros": 66, "gun_velocity": 64, "lightning_range": 62, "servos": 60,
     "lightning_chain": 50, "jets": 48, "sensors": 46, "mortar_reload": 30, "mortar_velocity": 28,
     "mortar_splash": 26, "laser_pierce": 20,
 }
 KNOWN_WEAPONS = ("gun", "mortar", "laser", "lightning")
-SECOND_RANK = {"lightning": 3, "laser": 2, "mortar": 1}
+SECOND_RANK = {"laser": 3, "lightning": 2}   # laser first; never pick up a mortar (laser cook-off)
+
+
+class _Ranks(dict):
+    """Weapon ranks for the shared loot code: .get() hides the mortar so it is never taken."""
+    def get(self, key, default=None):
+        return None if key == "mortar" else super().get(key, default)
+
+
+DUEL_WEAPON_RANK = _Ranks({"gun": 0, "mortar": -1, "lightning": 2, "laser": 3})
+FIRST_WEAPON_DETOUR_M = 160.0   # walk this far for a first laser or lightning
+LASER_DETOUR_M = 90.0           # and this far to add a laser
+LASER_RANGE_M = 130.0
+REPAIR_TO = 0.85                # heal to this share before hunting the next one
 VEL_SMOOTH = 0.35          # weight of the newest velocity sample in the per-target average
 RETREAT_FRACTION = 0.30    # break contact below this health share when the duel is going badly
 NPC_FARM_M = 120.0
@@ -41,6 +54,11 @@ class DuelBot(Bot):
         self.seen_hp = {}
         self.retreat_until = -math.inf
         self.mode = "start"
+        self.hp_share = 1.0
+        self.dodging = False
+        self.last_seen = {}        # mech id -> (time, pos)
+        self.kill_spot = None      # (time, pos) where a victim died
+        self.hunt_point = None     # (time, pos) best guess of where a hunter is
 
     # ------------------------------------------------------------------ targets
     def track(self, contacts):
@@ -60,6 +78,7 @@ class DuelBot(Bot):
 
     def target(self, obs, pos, contacts, fraction, zone, must_move, safe, terminal_burn, repairing, incoming):
         targets = []
+        farming_ok = self.hp_share >= 0.85
         mechs = [c for c in contacts if c.kind == "mech"]
         for c in contacts:
             if c.kind == "mech":
@@ -70,11 +89,11 @@ class DuelBot(Bot):
             else:
                 if mechs and any(m.clear and m.dist < 150 for m in mechs):
                     continue
-                if c.dist > NPC_FARM_M or terminal_burn:
+                if c.dist > NPC_FARM_M or terminal_burn or not (farming_ok or c.attacker):
                     continue
                 merit = 40 + (350 - min(350, c.hp)) * 0.1 - c.dist * 0.3 + 30 * c.attacker
             targets.append((merit, self.lead_contact(c)))
-        if not any(m.clear and m.dist < 150 for m in mechs) and not must_move and not terminal_burn:
+        if farming_ok and not any(m.clear and m.dist < 150 for m in mechs) and not must_move and not terminal_burn:
             for item in seq(obs.get("crates"))[:36]:
                 item = obj(item)
                 p, ident = vec(item.get("pos"), 3), number(item.get("id"), None)
@@ -94,7 +113,7 @@ class DuelBot(Bot):
         if "lightning" in kinds:
             r = 26.0
         elif "laser" in kinds:
-            r = 75.0
+            r = LASER_RANGE_M
         elif "mortar" in kinds:
             r = 60.0
         else:
@@ -126,6 +145,14 @@ class DuelBot(Bot):
             self.strafe_until = now + self.rng.uniform(STRAFE_MIN_S, STRAFE_MAX_S)
         to_me = bearing(foe.pos, pos)
         radial = limit((d - want) / 12.0, -1.0, 1.0)           # >0: too far, close in
+        if foe.charging and foe.aim is not None and d > 25 and abs(angle(foe.aim[0] - bearing(foe.pos, pos))) < 0.2:
+            # A laser is charging on us: step sideways at full speed, no radial drift.
+            if not self.dodging:
+                self.dodging = True
+                self.strafe_until = now + self.rng.uniform(0.5, 0.9)
+            radial = 0.0
+        else:
+            self.dodging = False
         # Move tangentially around the foe, plus a radial correction toward the wanted range.
         tangent = to_me + self.strafe_sign * math.pi / 2
         mx = math.cos(tangent) * (1 - abs(radial) * 0.6) - math.cos(to_me) * radial
@@ -140,7 +167,8 @@ class DuelBot(Bot):
         if abs(angle(free - course)) > 1.2 and now >= self.strafe_until - 0.25:
             self.strafe_sign = -self.strafe_sign
             self.strafe_until = now + self.rng.uniform(0.35, 0.9)
-        boost = energy > 45 and (d > want + 25 or (foe.clear and foe.dist < 90 and "lightning" not in kinds))
+        boost = (energy > 45 and (d > want + 25 or (foe.clear and foe.dist < 90 and "lightning" not in kinds))
+                 or self.dodging and energy > 15)
         return [math.cos(free), math.sin(free)], boost
 
     # ---------------------------------------------------------------------- act
@@ -179,6 +207,7 @@ class DuelBot(Bot):
         walk = limit(self.phys("walk_speed", 11.7, stats), 2, 60)
         hp = max(0, number(me.get("hp"), 1400))
         fraction = limit(hp / max(1, number(me.get("max_hp"), 1400)), 0, 1)
+        self.hp_share = fraction
         energy = limit(number(me.get("energy"), 0), 0, 1000)
         grounded = me.get("grounded") is not False
         cubes = limit(number(me.get("cubes")), 0, 100)
@@ -206,6 +235,17 @@ class DuelBot(Bot):
         self.remember(obs, now)
         contacts = self.contacts(obs, pos, eye)
         self.track(contacts)
+        for c in contacts:
+            if c.kind == "mech":
+                self.last_seen[c.id] = (now, c.pos)
+        for event in seq(obs.get("events"))[:40]:
+            event = obj(event)
+            if event.get("type") == "kill":
+                victim = number(event.get("target"), None)
+                seen = self.last_seen.get(victim)
+                if seen is not None:
+                    self.kill_spot = (now, seen[1])
+        self.update_hunt_point(obs, pos, now)
         items = seq(me.get("weapons"))
         weapons = [obj(items[i]) if i < len(items) else {} for i in range(2)]
         kinds = {w.get("kind") for w in weapons if w.get("kind") in KNOWN_WEAPONS}
@@ -260,10 +300,32 @@ class DuelBot(Bot):
                     goal = zone.next_center
             boost = energy > 20
         elif not urgent and not terminal_burn:
-            pickup = self.loot_goal(obs, pos, zone, contacts, weapons, fraction, cubes, True, urgent, action)
-            if pickup is not None:
+            saved = eb.WEAPON_RANK, eb.WEAPON_DETOUR_M
+            eb.WEAPON_RANK = DUEL_WEAPON_RANK   # one ranking for walking to loot and swapping at our feet
+            if not ({"laser", "lightning"} & kinds):
+                eb.WEAPON_DETOUR_M = FIRST_WEAPON_DETOUR_M
+            elif "laser" not in kinds:
+                eb.WEAPON_DETOUR_M = LASER_DETOUR_M
+            try:
+                pickup = self.loot_goal(obs, pos, zone, contacts, weapons, fraction, cubes, True, urgent, action)
+            finally:
+                eb.WEAPON_RANK, eb.WEAPON_DETOUR_M = saved
+            self.keep_lightning(obs, weapons, action)
+            cube = self.cube_goal(obs, pos, zone)
+            if self.kill_spot is not None and (now - self.kill_spot[0] > 30 or distance(pos, self.kill_spot[1]) < 5):
+                self.kill_spot = None
+            if cube is not None:
+                goal = cube
+                self.mode = "cube"
+            elif pickup is not None:
                 goal = pickup
                 self.mode = "loot"
+            elif self.kill_spot is not None and zone.gap(self.kill_spot[1], 5) > 3:
+                goal = self.kill_spot[1][:2]
+                self.mode = "spoils"
+            elif self.hunt_point is not None and fraction > REPAIR_TO and zone.gap(self.hunt_point[1], 5) > 3:
+                goal = self.hunt_point[1][:2]
+                self.mode = "hunt"
             else:
                 farm = self.farm_goal(obs, pos, contacts, zone)
                 if farm is not None:
@@ -323,6 +385,41 @@ class DuelBot(Bot):
             action["boost"] = bool(boosting) and not charging
         return action
 
+    def cube_goal(self, obs, pos, zone):
+        best, goal = math.inf, None
+        for item in seq(obs.get("cubes"))[:40]:
+            p = vec(obj(item).get("pos"), 3)
+            if p is None or abs(p[2] - pos[2]) > 10 or zone.gap(p, 6) < 3:
+                continue
+            d = distance(pos, p)
+            if d < 140 and d < best:
+                best, goal = d, p[:2]
+        return goal
+
+    def update_hunt_point(self, obs, pos, now):
+        if self.hunt_point is not None and (now - self.hunt_point[0] > 12 or distance(pos, self.hunt_point[1]) < 8):
+            self.hunt_point = None
+        recent = [v for v in self.last_seen.values() if now - v[0] < 15]
+        if recent:
+            t, p = max(recent, key=lambda v: v[0])
+            if now - t > 0.5:
+                self.hunt_point = (t, p)
+                return
+        if now - self.last_damage < 2 and self.damage_bearing is not None:
+            b = self.damage_bearing
+            self.hunt_point = (now, (pos[0] + 60 * math.cos(b), pos[1] + 60 * math.sin(b), pos[2]))
+            return
+        for sound in seq(obs.get("sounds"))[:40]:
+            sound = obj(sound)
+            if sound.get("kind") not in ("gun", "lightning", "laser", "mortar", "step", "boost"):
+                continue
+            b = number(sound.get("bearing"), None)
+            if b is None:
+                continue
+            reach = {"near": 40, "mid": 100}.get(sound.get("dist"), 180)
+            self.hunt_point = (now, (pos[0] + reach * math.cos(b), pos[1] + reach * math.sin(b), pos[2]))
+            return
+
     def farm_goal(self, obs, pos, contacts, zone):
         best, goal = math.inf, None
         for c in contacts:
@@ -342,6 +439,20 @@ class DuelBot(Bot):
             return None  # close enough to shoot it from here
         return goal
 
+    def keep_lightning(self, obs, weapons, action):
+        """Taking a laser while holding gun + lightning: drop the gun, keep the arc."""
+        take = action.get("take")
+        if take is None or "drop" not in action:
+            return
+        kinds = [w.get("kind") for w in weapons]
+        kind = None
+        for item in seq(obs.get("pickups"))[:40]:
+            item = obj(item)
+            if number(item.get("id"), None) == take:
+                kind = item.get("kind")
+        if kind == "laser" and "lightning" in kinds and "gun" in kinds:
+            action["drop"] = kinds.index("gun")
+
     def better_weapon(self, obs, pos, weapons, action):
         """Swap the gun or a weak second weapon for a better one lying within reach."""
         if "take" in action:
@@ -360,6 +471,9 @@ class DuelBot(Bot):
                 if not k:
                     action["take"] = ident
                     return
+            if kind == "laser" and "lightning" in held and "gun" in held:
+                action["take"], action["drop"] = ident, held.index("gun")
+                return
             for slot, w in enumerate(weapons):
                 k = w.get("kind")
                 if isinstance(k, str) and k in SECOND_RANK and SECOND_RANK[kind] > SECOND_RANK[k] and number(w.get("charge")) <= 0:
